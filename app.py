@@ -8,6 +8,15 @@ import time
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Inventario Cristales", layout="wide")
 
+# --- MAPEO DE NOMBRES (AQUÍ ESTÁ EL CAMBIO VISUAL) ---
+# Esto traduce el nombre técnico de la hoja al nombre que quieres ver en pantalla
+NOMBRES_SUCURSALES = {
+    "Inventario_Suc1": "Arriaga",
+    "Inventario_Suc2": "Libramiento",
+    "Inventario_Suc3": "Zamora",
+    "todas": "Todas las Sucursales"
+}
+
 # --- CONEXIÓN A GOOGLE SHEETS ---
 try:
     scopes = [
@@ -31,6 +40,8 @@ except Exception as e:
     st.stop()
 
 # --- USUARIOS (CONTRASEÑAS ALEATORIAS Y ACTUALIZADAS) ---
+# Nota: Los usuarios para LOGIN siguen siendo los mismos para no confundirte, 
+# pero una vez dentro, verán los nombres nuevos.
 credenciales = {
     "admin":      {"pass": "Xk9#mZ21!",     "rol": "admin", "sucursal": "todas"},
     "sucursal1":  {"pass": "Suc1_Ax7$",     "rol": "user",  "sucursal": "Inventario_Suc1"},
@@ -50,14 +61,14 @@ def obtener_fila_exacta(ws, clave, rack):
     rack = str(rack).upper().strip()
     
     # Aseguramos que las columnas sean string para comparar
-    df['CLAVE'] = df['CLAVE'].astype(str).str.upper().str.strip()
-    df['RACK'] = df['RACK'].astype(str).str.upper().str.strip()
-    
-    filtro = df[(df['CLAVE'] == clave) & (df['RACK'] == rack)]
-    
-    if not filtro.empty:
-        # Retornamos el índice + 2 (1 por base-0 de pandas, 1 por encabezado de Sheets)
-        return filtro.index[0] + 2, int(filtro.iloc[0]['CANTIDAD'])
+    if not df.empty:
+        df['CLAVE'] = df['CLAVE'].astype(str).str.upper().str.strip()
+        df['RACK'] = df['RACK'].astype(str).str.upper().str.strip()
+        filtro = df[(df['CLAVE'] == clave) & (df['RACK'] == rack)]
+        
+        if not filtro.empty:
+            # Retornamos el índice + 2 (1 por base-0 de pandas, 1 por encabezado de Sheets)
+            return filtro.index[0] + 2, int(filtro.iloc[0]['CANTIDAD'])
     return None, 0
 
 def guardar_entrada(ws_destino, clave, nombre, rack, cantidad, usuario):
@@ -105,9 +116,11 @@ def iniciar_traslado(ws_origen, clave, rack, cantidad, suc_destino, usuario):
         ws_origen.update_cell(fila, 4, nueva_cant)
         
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Guardamos origen y destino
+        # Guardamos origen y destino (Nombres técnicos para la BD)
         hojas['Traslados_Pendientes'].append_row([fecha, clave, nombre_prod, cantidad, ws_origen.title, suc_destino])
-        hojas['Movimientos'].append_row([fecha, clave, "Envío Traslado", f"Desde {rack} a {suc_destino}", cantidad, 0, usuario, ws_origen.title])
+        
+        # Para el historial, guardamos nombres legibles si es posible, pero mejor mantener consistencia técnica
+        hojas['Movimientos'].append_row([fecha, clave, "Envío Traslado", f"Desde {rack} a {NOMBRES_SUCURSALES.get(suc_destino, suc_destino)}", cantidad, 0, usuario, ws_origen.title])
 
         return True, f"✅ Enviado a tránsito. Quedan {nueva_cant} en {rack}."
     except Exception as e:
@@ -165,38 +178,36 @@ if not st.session_state.logueado:
         st.title("🔐 SISTEMA CRISTALES")
         st.markdown("---")
         
-        # --- CAMBIO IMPORTANTE AQUÍ ABAJO ---
-        # Agregamos .strip() para borrar espacios accidentales
         u = st.text_input("Usuario").strip() 
         p = st.text_input("Contraseña", type="password").strip()
-        # ------------------------------------
 
         if st.button("ENTRAR", type="primary"):
-            # Pequeño truco para ver qué está recibiendo el sistema (borrar luego)
-            # st.write(f"Intentando entrar con: '{u}' y '{p}'") 
-            
             if u in credenciales and credenciales[u]["pass"] == p:
                 st.session_state.logueado = True
                 st.session_state.user_data = {"user": u, **credenciales[u]}
                 st.rerun()
             else:
-                st.error("Datos incorrectos. Verifica mayúsculas y espacios.")
+                st.error("Datos incorrectos.")
         st.markdown("---")
     st.stop()
 
 # --- INTERFAZ PRINCIPAL ---
 
-# === AGREGA ESTE BLOQUE DE SEGURIDAD ===
+# === BLOQUE DE SEGURIDAD ===
 if "user_data" not in st.session_state:
     st.session_state.logueado = False
     st.rerun()
 # =======================================
 
-usuario = st.session_state.user_data["user"] # Esta es la línea que te daba error
+usuario = st.session_state.user_data["user"]
 rol = st.session_state.user_data["rol"]
 sucursal_asignada = st.session_state.user_data["sucursal"]
+
+# --- BARRA LATERAL CON NOMBRE BONITO ---
 with st.sidebar:
-    st.header(f"🏢 {sucursal_asignada.replace('Inventario_','').upper()}")
+    # Aquí buscamos el nombre bonito en el diccionario
+    nombre_visual_sucursal = NOMBRES_SUCURSALES.get(sucursal_asignada, sucursal_asignada)
+    st.header(f"🏢 {nombre_visual_sucursal}")
     st.caption(f"Usuario: {usuario}")
     if st.button("Cerrar Sesión"):
         st.session_state.logueado = False
@@ -206,7 +217,12 @@ with st.sidebar:
 # Definir hoja activa
 if rol == "admin":
     opciones_suc = ["Inventario_Suc1", "Inventario_Suc2", "Inventario_Suc3"]
-    sucursal_visualizada = st.selectbox("Vista Admin - Inventario:", opciones_suc)
+    # Usamos format_func para que el selectbox muestre "Arriaga" en vez de "Inventario_Suc1"
+    sucursal_visualizada = st.selectbox(
+        "Vista Admin - Inventario:", 
+        opciones_suc, 
+        format_func=lambda x: NOMBRES_SUCURSALES.get(x, x)
+    )
     ws_activo = hojas[sucursal_visualizada]
 else:
     sucursal_visualizada = sucursal_asignada
@@ -238,39 +254,32 @@ if menu == "📦 Operaciones":
                     else: st.error(txt)
                 else: st.warning("Falta clave.")
 
-    # --- SECCIÓN BAJA/TRASLADO (MODIFICADA PARA SELECCIONAR RACK) ---
+    # --- SECCIÓN BAJA/TRASLADO ---
     with st.expander("➖ BAJA (Venta) o ENVÍO (Traslado)", expanded=True):
         st.write("**Paso 1: Buscar Producto**")
         
-        # Input fuera del form para permitir interactividad
         b_clave_input = st.text_input("🔍 Ingresa Clave del producto:", placeholder="Ej. DW01234").upper().strip()
         
         racks_disponibles = []
         if b_clave_input and not df_inventario.empty:
-            # Buscar racks donde existe esa clave
             filtro_prod = df_inventario[df_inventario['CLAVE'] == b_clave_input]
             if not filtro_prod.empty:
-                # Crear lista legible: "A1 (Cant: 5)"
                 racks_disponibles = [f"{row['RACK']} (Disp: {row['CANTIDAD']})" for i, row in filtro_prod.iterrows()]
             else:
                 st.warning("⚠️ Producto no encontrado en esta sucursal.")
 
         if racks_disponibles:
             st.write("**Paso 2: Detalles de la Operación**")
-            # Selección de tipo de operación
             tipo_op = st.radio("Tipo:", ["Venta / Instalación", "Enviar a otra Sucursal"], horizontal=True)
             
             with st.form("form_baja_dinamica"):
                 col_rack, col_cant = st.columns(2)
                 
-                # Selector de Rack basado en la búsqueda
                 rack_seleccionado_texto = col_rack.selectbox("📍 Selecciona Rack de origen:", racks_disponibles)
-                # Extraer solo el nombre del rack del string "RACK (Disp: X)"
                 rack_real = rack_seleccionado_texto.split(" (Disp:")[0]
                 
                 cant_baja = col_cant.number_input("Cantidad", 1, 50, 1)
                 
-                # Lógica condicional según tipo de operación
                 ok = False
                 msg = ""
                 
@@ -290,7 +299,13 @@ if menu == "📦 Operaciones":
                     st.info(f"El producto saldrá del rack: {rack_real}")
                     todas = ["Inventario_Suc1", "Inventario_Suc2", "Inventario_Suc3"]
                     otras = [s for s in todas if s != sucursal_visualizada]
-                    destino = st.selectbox("Enviar a:", otras)
+                    
+                    # AQUÍ: Usamos format_func para mostrar los nombres bonitos en el selectbox
+                    destino = st.selectbox(
+                        "Enviar a:", 
+                        otras, 
+                        format_func=lambda x: NOMBRES_SUCURSALES.get(x, x)
+                    )
                     
                     if st.form_submit_button("🚚 Enviar Traslado", type="primary"):
                         ok, msg = iniciar_traslado(ws_activo, b_clave_input, rack_real, cant_baja, destino, usuario)
@@ -298,7 +313,7 @@ if menu == "📦 Operaciones":
                 if ok: 
                     st.success(msg)
                     time.sleep(2)
-                    st.rerun() # Recargar para actualizar inventario visual
+                    st.rerun()
                 elif msg: 
                     st.error(msg)
         elif b_clave_input:
@@ -329,11 +344,18 @@ elif menu == "🚚 Traslados en Camino":
         tab_recibir, tab_enviados = st.tabs(["📥 POR RECIBIR", "📤 ENVIADOS"])
         with tab_recibir:
             mis_llegadas = df_p[df_p['DESTINO'] == sucursal_visualizada].reset_index()
+            
+            # Reemplazar nombres técnicos por bonitos para visualización en tabla
+            df_mostrar = mis_llegadas.copy()
+            if not df_mostrar.empty:
+                df_mostrar['ORIGEN'] = df_mostrar['ORIGEN'].map(NOMBRES_SUCURSALES).fillna(df_mostrar['ORIGEN'])
+
             if mis_llegadas.empty:
                 st.success("✅ No tienes envíos pendientes.")
             else:
                 st.warning(f"Tienes {len(mis_llegadas)} envíos esperando recepción.")
-                st.dataframe(mis_llegadas[['FECHA','ORIGEN','CLAVE','NOMBRE','CANTIDAD']], use_container_width=True)
+                # Mostramos df_mostrar que tiene los nombres bonitos
+                st.dataframe(df_mostrar[['FECHA','ORIGEN','CLAVE','NOMBRE','CANTIDAD']], use_container_width=True)
                 st.divider()
                 st.subheader("📦 Procesar Recepción")
                 opciones = mis_llegadas.apply(lambda x: f"{x['CLAVE']} - {x['NOMBRE']} (Cant: {x['CANTIDAD']})", axis=1).tolist()
@@ -355,11 +377,18 @@ elif menu == "🚚 Traslados en Camino":
                             else: st.warning("Escribe el Rack.")
         with tab_enviados:
             mis_envios = df_p[df_p['ORIGEN'] == sucursal_visualizada]
-            st.dataframe(mis_envios[['FECHA','DESTINO','CLAVE','CANTIDAD']], use_container_width=True)
+            # Reemplazar nombres técnicos por bonitos para visualización
+            df_enviados_mostrar = mis_envios.copy()
+            if not df_enviados_mostrar.empty:
+                df_enviados_mostrar['DESTINO'] = df_enviados_mostrar['DESTINO'].map(NOMBRES_SUCURSALES).fillna(df_enviados_mostrar['DESTINO'])
+            
+            st.dataframe(df_enviados_mostrar[['FECHA','DESTINO','CLAVE','CANTIDAD']], use_container_width=True)
 
 # PESTAÑA 3: RACK
 elif menu == "👀 Rack Visual":
-    st.title(f"Visor - {sucursal_visualizada}")
+    # Usamos el nombre bonito en el título
+    nombre_visual = NOMBRES_SUCURSALES.get(sucursal_visualizada, sucursal_visualizada)
+    st.title(f"Visor - {nombre_visual}")
     if st.button("🔄 Refrescar"): st.rerun()
     
     # Recargar datos frescos
