@@ -8,8 +8,7 @@ import time
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Inventario Cristales", layout="wide")
 
-# --- MAPEO DE NOMBRES (AQUÍ ESTÁ EL CAMBIO VISUAL) ---
-# Esto traduce el nombre técnico de la hoja al nombre que quieres ver en pantalla
+# --- MAPEO DE NOMBRES ---
 NOMBRES_SUCURSALES = {
     "Inventario_Suc1": "Arriaga",
     "Inventario_Suc2": "Libramiento",
@@ -39,9 +38,7 @@ except Exception as e:
     st.error(f"⚠️ Error de conexión: {e}")
     st.stop()
 
-# --- USUARIOS (CONTRASEÑAS ALEATORIAS Y ACTUALIZADAS) ---
-# Nota: Los usuarios para LOGIN siguen siendo los mismos para no confundirte, 
-# pero una vez dentro, verán los nombres nuevos.
+# --- USUARIOS ---
 credenciales = {
     "admin":      {"pass": "Xk9#mZ21!",     "rol": "admin", "sucursal": "todas"},
     "sucursal1":  {"pass": "Suc1_Ax7$",     "rol": "user",  "sucursal": "Inventario_Suc1"},
@@ -49,25 +46,20 @@ credenciales = {
     "sucursal3":  {"pass": "T3rcera_P0s#",  "rol": "user",  "sucursal": "Inventario_Suc3"}
 }
 
-# --- FUNCIONES DE LÓGICA ACTUALIZADAS (SOPORTE PARA RACKS) ---
+# --- FUNCIONES DE LÓGICA ---
 
 def obtener_fila_exacta(ws, clave, rack):
-    """Busca la fila exacta coincidiendo Clave y Rack"""
     data = ws.get_all_records()
     df = pd.DataFrame(data)
-    
-    # Filtramos por clave y rack (normalizando texto)
     clave = str(clave).upper().strip()
     rack = str(rack).upper().strip()
     
-    # Aseguramos que las columnas sean string para comparar
     if not df.empty:
         df['CLAVE'] = df['CLAVE'].astype(str).str.upper().str.strip()
         df['RACK'] = df['RACK'].astype(str).str.upper().str.strip()
         filtro = df[(df['CLAVE'] == clave) & (df['RACK'] == rack)]
         
         if not filtro.empty:
-            # Retornamos el índice + 2 (1 por base-0 de pandas, 1 por encabezado de Sheets)
             return filtro.index[0] + 2, int(filtro.iloc[0]['CANTIDAD'])
     return None, 0
 
@@ -78,20 +70,16 @@ def guardar_entrada(ws_destino, clave, nombre, rack, cantidad, usuario):
         rack = str(rack).upper().strip()
         cantidad = int(cantidad) 
         
-        # Verificar si ya existe esa Clave en ese Rack Específico
         fila, cant_actual = obtener_fila_exacta(ws_destino, clave, rack)
 
         if fila:
-            # Si existe, actualizamos esa celda específica
             nueva_cant = cant_actual + cantidad
-            ws_destino.update_cell(fila, 4, nueva_cant) # Columna 4 es Cantidad
-            ws_destino.update_cell(fila, 5, fecha)      # Columna 5 es Fecha
+            ws_destino.update_cell(fila, 4, nueva_cant)
+            ws_destino.update_cell(fila, 5, fecha)
             return True, f"✅ Recibido en Rack {rack}. Total: {nueva_cant}"
         else:
-            # Si no existe esa combinación, creamos fila nueva
             ws_destino.append_row([clave, nombre, rack, cantidad, fecha])
             return True, f"✅ Nuevo registro creado en Rack {rack}."
-            
     except Exception as e:
         return False, f"Error técnico en guardar: {e}"
 
@@ -109,17 +97,12 @@ def iniciar_traslado(ws_origen, clave, rack, cantidad, suc_destino, usuario):
         if cant_actual < cantidad:
             return False, f"❌ Stock insuficiente en Rack {rack}. Tienes: {cant_actual}"
 
-        # Obtener nombre del producto (Columna 2)
         nombre_prod = ws_origen.cell(fila, 2).value 
-
         nueva_cant = cant_actual - cantidad
         ws_origen.update_cell(fila, 4, nueva_cant)
         
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Guardamos origen y destino (Nombres técnicos para la BD)
         hojas['Traslados_Pendientes'].append_row([fecha, clave, nombre_prod, cantidad, ws_origen.title, suc_destino])
-        
-        # Para el historial, guardamos nombres legibles si es posible, pero mejor mantener consistencia técnica
         hojas['Movimientos'].append_row([fecha, clave, "Envío Traslado", f"Desde {rack} a {NOMBRES_SUCURSALES.get(suc_destino, suc_destino)}", cantidad, 0, usuario, ws_origen.title])
 
         return True, f"✅ Enviado a tránsito. Quedan {nueva_cant} en {rack}."
@@ -154,7 +137,6 @@ def finalizar_recepcion(suc_destino_nombre, clave, nombre, cantidad, rack, usuar
     try:
         cantidad = int(cantidad)
         fila_traslado = int(fila_traslado)
-        
         ws_local = hojas[suc_destino_nombre]
         ok, msg = guardar_entrada(ws_local, clave, nombre, rack, cantidad, usuario)
         
@@ -177,10 +159,8 @@ if not st.session_state.logueado:
     with col2:
         st.title("🔐 SISTEMA CRISTALES")
         st.markdown("---")
-        
         u = st.text_input("Usuario").strip() 
         p = st.text_input("Contraseña", type="password").strip()
-
         if st.button("ENTRAR", type="primary"):
             if u in credenciales and credenciales[u]["pass"] == p:
                 st.session_state.logueado = True
@@ -193,19 +173,15 @@ if not st.session_state.logueado:
 
 # --- INTERFAZ PRINCIPAL ---
 
-# === BLOQUE DE SEGURIDAD ===
 if "user_data" not in st.session_state:
     st.session_state.logueado = False
     st.rerun()
-# =======================================
 
 usuario = st.session_state.user_data["user"]
 rol = st.session_state.user_data["rol"]
 sucursal_asignada = st.session_state.user_data["sucursal"]
 
-# --- BARRA LATERAL CON NOMBRE BONITO ---
 with st.sidebar:
-    # Aquí buscamos el nombre bonito en el diccionario
     nombre_visual_sucursal = NOMBRES_SUCURSALES.get(sucursal_asignada, sucursal_asignada)
     st.header(f"🏢 {nombre_visual_sucursal}")
     st.caption(f"Usuario: {usuario}")
@@ -214,13 +190,10 @@ with st.sidebar:
         st.rerun()
     menu = st.radio("Menú", ["📦 Operaciones", "🚚 Traslados en Camino", "👀 Rack Visual"])
 
-# Definir hoja activa
 if rol == "admin":
     opciones_suc = ["Inventario_Suc1", "Inventario_Suc2", "Inventario_Suc3"]
-    # Usamos format_func para que el selectbox muestre "Arriaga" en vez de "Inventario_Suc1"
     sucursal_visualizada = st.selectbox(
-        "Vista Admin - Inventario:", 
-        opciones_suc, 
+        "Vista Admin - Inventario:", opciones_suc, 
         format_func=lambda x: NOMBRES_SUCURSALES.get(x, x)
     )
     ws_activo = hojas[sucursal_visualizada]
@@ -228,9 +201,7 @@ else:
     sucursal_visualizada = sucursal_asignada
     ws_activo = hojas[sucursal_asignada]
 
-# Obtener Dataframe Global para búsquedas rápidas
 df_inventario = pd.DataFrame(ws_activo.get_all_records())
-# Limpieza de columnas clave
 if not df_inventario.empty:
     df_inventario['CLAVE'] = df_inventario['CLAVE'].astype(str).str.upper().str.strip()
     df_inventario['RACK'] = df_inventario['RACK'].astype(str).str.upper().str.strip()
@@ -254,10 +225,9 @@ if menu == "📦 Operaciones":
                     else: st.error(txt)
                 else: st.warning("Falta clave.")
 
-    # --- SECCIÓN BAJA/TRASLADO ---
+    # --- SECCIÓN BAJA/TRASLADO (MODIFICADA) ---
     with st.expander("➖ BAJA (Venta) o ENVÍO (Traslado)", expanded=True):
         st.write("**Paso 1: Buscar Producto**")
-        
         b_clave_input = st.text_input("🔍 Ingresa Clave del producto:", placeholder="Ej. DW01234").upper().strip()
         
         racks_disponibles = []
@@ -274,10 +244,8 @@ if menu == "📦 Operaciones":
             
             with st.form("form_baja_dinamica"):
                 col_rack, col_cant = st.columns(2)
-                
                 rack_seleccionado_texto = col_rack.selectbox("📍 Selecciona Rack de origen:", racks_disponibles)
                 rack_real = rack_seleccionado_texto.split(" (Disp:")[0]
-                
                 cant_baja = col_cant.number_input("Cantidad", 1, 50, 1)
                 
                 ok = False
@@ -286,10 +254,24 @@ if menu == "📦 Operaciones":
                 if tipo_op == "Venta / Instalación":
                     st.divider()
                     col_c, col_d = st.columns(2)
-                    aseg = col_c.selectbox("Cliente:", ["Público General", "ANA", "GNP", "Zurich", "Qualitas", "CHUBB"])
-                    nota = st.text_input("Nota adicional:")
-                    prec = col_d.number_input("Precio $", 0.0)
-                    detalle = f"{aseg} - {nota}" if nota else aseg
+                    
+                    # --- NUEVA LÓGICA DE CLIENTE ---
+                    tipo_cliente = col_c.radio("¿Tipo de Cliente?", ["Público General", "Asegurado"], horizontal=True)
+                    
+                    # Campo para escribir nombre de aseguradora
+                    nombre_aseguradora = col_c.text_input("Nombre Aseguradora (Si aplica):", placeholder="Ej: Qualitas, GNP...")
+                    
+                    # Nota Adicional
+                    nota = st.text_input("Nota / Observaciones:")
+                    prec = col_d.number_input("Precio Venta $", 0.0)
+
+                    # Construir el detalle automáticamente
+                    if tipo_cliente == "Asegurado":
+                         # Si no escribe nada, ponemos "Asegurado" a secas
+                         aseg_txt = nombre_aseguradora if nombre_aseguradora else "Asegurado"
+                         detalle = f"Aseg: {aseg_txt} - {nota}"
+                    else:
+                         detalle = f"Público Gral - {nota}"
                     
                     if st.form_submit_button("💰 Confirmar Venta", type="primary"):
                         ok, msg = procesar_baja_venta(ws_activo, b_clave_input, rack_real, detalle, cant_baja, prec, usuario)
@@ -299,13 +281,7 @@ if menu == "📦 Operaciones":
                     st.info(f"El producto saldrá del rack: {rack_real}")
                     todas = ["Inventario_Suc1", "Inventario_Suc2", "Inventario_Suc3"]
                     otras = [s for s in todas if s != sucursal_visualizada]
-                    
-                    # AQUÍ: Usamos format_func para mostrar los nombres bonitos en el selectbox
-                    destino = st.selectbox(
-                        "Enviar a:", 
-                        otras, 
-                        format_func=lambda x: NOMBRES_SUCURSALES.get(x, x)
-                    )
+                    destino = st.selectbox("Enviar a:", otras, format_func=lambda x: NOMBRES_SUCURSALES.get(x, x))
                     
                     if st.form_submit_button("🚚 Enviar Traslado", type="primary"):
                         ok, msg = iniciar_traslado(ws_activo, b_clave_input, rack_real, cant_baja, destino, usuario)
@@ -328,7 +304,6 @@ if menu == "📦 Operaciones":
 elif menu == "🚚 Traslados en Camino":
     st.title("Gestión de Traslados")
     if st.button("🔄 Actualizar Lista"): st.rerun()
-    
     try:
         data_pend = hojas['Traslados_Pendientes'].get_all_records()
         df_p = pd.DataFrame(data_pend)
@@ -344,8 +319,6 @@ elif menu == "🚚 Traslados en Camino":
         tab_recibir, tab_enviados = st.tabs(["📥 POR RECIBIR", "📤 ENVIADOS"])
         with tab_recibir:
             mis_llegadas = df_p[df_p['DESTINO'] == sucursal_visualizada].reset_index()
-            
-            # Reemplazar nombres técnicos por bonitos para visualización en tabla
             df_mostrar = mis_llegadas.copy()
             if not df_mostrar.empty:
                 df_mostrar['ORIGEN'] = df_mostrar['ORIGEN'].map(NOMBRES_SUCURSALES).fillna(df_mostrar['ORIGEN'])
@@ -354,7 +327,6 @@ elif menu == "🚚 Traslados en Camino":
                 st.success("✅ No tienes envíos pendientes.")
             else:
                 st.warning(f"Tienes {len(mis_llegadas)} envíos esperando recepción.")
-                # Mostramos df_mostrar que tiene los nombres bonitos
                 st.dataframe(df_mostrar[['FECHA','ORIGEN','CLAVE','NOMBRE','CANTIDAD']], use_container_width=True)
                 st.divider()
                 st.subheader("📦 Procesar Recepción")
@@ -377,27 +349,21 @@ elif menu == "🚚 Traslados en Camino":
                             else: st.warning("Escribe el Rack.")
         with tab_enviados:
             mis_envios = df_p[df_p['ORIGEN'] == sucursal_visualizada]
-            # Reemplazar nombres técnicos por bonitos para visualización
             df_enviados_mostrar = mis_envios.copy()
             if not df_enviados_mostrar.empty:
                 df_enviados_mostrar['DESTINO'] = df_enviados_mostrar['DESTINO'].map(NOMBRES_SUCURSALES).fillna(df_enviados_mostrar['DESTINO'])
-            
             st.dataframe(df_enviados_mostrar[['FECHA','DESTINO','CLAVE','CANTIDAD']], use_container_width=True)
 
 # PESTAÑA 3: RACK
 elif menu == "👀 Rack Visual":
-    # Usamos el nombre bonito en el título
     nombre_visual = NOMBRES_SUCURSALES.get(sucursal_visualizada, sucursal_visualizada)
     st.title(f"Visor - {nombre_visual}")
     if st.button("🔄 Refrescar"): st.rerun()
     
-    # Recargar datos frescos
     df = pd.DataFrame(ws_activo.get_all_records())
-    
     if not df.empty and 'RACK' in df.columns:
         df['RACK'] = df['RACK'].astype(str).str.upper().str.strip()
         racks = sorted(df['RACK'].unique().tolist())
-        
         col_r1, col_r2 = st.columns([1, 3])
         with col_r1:
             sel = st.radio("Selecciona Rack:", racks)
