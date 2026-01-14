@@ -103,6 +103,7 @@ def iniciar_traslado(ws_origen, clave, rack, cantidad, suc_destino, usuario):
         
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         hojas['Traslados_Pendientes'].append_row([fecha, clave, nombre_prod, cantidad, ws_origen.title, suc_destino])
+        # Log en Movimientos
         hojas['Movimientos'].append_row([fecha, clave, "Envío Traslado", f"Desde {rack} a {NOMBRES_SUCURSALES.get(suc_destino, suc_destino)}", cantidad, 0, usuario, ws_origen.title])
 
         return True, f"✅ Enviado a tránsito. Quedan {nueva_cant} en {rack}."
@@ -127,6 +128,7 @@ def procesar_baja_venta(ws_origen, clave, rack, detalle, cantidad, precio, usuar
         ws_origen.update_cell(fila, 4, nueva_cant)
         
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Log en Movimientos
         hojas['Movimientos'].append_row([fecha, clave, "Venta/Instalación", f"{detalle} (Desde {rack})", cantidad, precio, usuario, ws_origen.title])
         
         return True, f"✅ Venta registrada desde {rack}. Quedan {nueva_cant}."
@@ -143,6 +145,7 @@ def finalizar_recepcion(suc_destino_nombre, clave, nombre, cantidad, rack, usuar
         if ok:
             hojas['Traslados_Pendientes'].delete_rows(fila_traslado)
             fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Log en Movimientos
             hojas['Movimientos'].append_row([fecha, clave, "Recepción Traslado", "Recibido en sucursal", cantidad, 0, usuario, suc_destino_nombre])
             return True, msg
         else:
@@ -181,6 +184,7 @@ usuario = st.session_state.user_data["user"]
 rol = st.session_state.user_data["rol"]
 sucursal_asignada = st.session_state.user_data["sucursal"]
 
+# --- BARRA LATERAL ---
 with st.sidebar:
     nombre_visual_sucursal = NOMBRES_SUCURSALES.get(sucursal_asignada, sucursal_asignada)
     st.header(f"🏢 {nombre_visual_sucursal}")
@@ -188,8 +192,17 @@ with st.sidebar:
     if st.button("Cerrar Sesión"):
         st.session_state.logueado = False
         st.rerun()
-    menu = st.radio("Menú", ["📦 Operaciones", "🚚 Traslados en Camino", "👀 Rack Visual"])
+    
+    # Definimos las opciones del menú
+    opciones_menu = ["📦 Operaciones", "🚚 Traslados en Camino", "👀 Rack Visual"]
+    
+    # Si es ADMIN, agregamos la opción de historial
+    if rol == "admin":
+        opciones_menu.append("📜 Historial de Movimientos")
+        
+    menu = st.radio("Menú", opciones_menu)
 
+# Lógica de visualización de inventario
 if rol == "admin":
     opciones_suc = ["Inventario_Suc1", "Inventario_Suc2", "Inventario_Suc3"]
     sucursal_visualizada = st.selectbox(
@@ -201,12 +214,15 @@ else:
     sucursal_visualizada = sucursal_asignada
     ws_activo = hojas[sucursal_asignada]
 
+# Pre-carga de inventario
 df_inventario = pd.DataFrame(ws_activo.get_all_records())
 if not df_inventario.empty:
     df_inventario['CLAVE'] = df_inventario['CLAVE'].astype(str).str.upper().str.strip()
     df_inventario['RACK'] = df_inventario['RACK'].astype(str).str.upper().str.strip()
 
+# ==========================================
 # PESTAÑA 1: OPERACIONES
+# ==========================================
 if menu == "📦 Operaciones":
     st.title("Operaciones de Inventario")
 
@@ -225,7 +241,7 @@ if menu == "📦 Operaciones":
                     else: st.error(txt)
                 else: st.warning("Falta clave.")
 
-    # --- SECCIÓN BAJA/TRASLADO (MODIFICADA) ---
+    # --- SECCIÓN BAJA/TRASLADO ---
     with st.expander("➖ BAJA (Venta) o ENVÍO (Traslado)", expanded=True):
         st.write("**Paso 1: Buscar Producto**")
         b_clave_input = st.text_input("🔍 Ingresa Clave del producto:", placeholder="Ej. DW01234").upper().strip()
@@ -254,20 +270,12 @@ if menu == "📦 Operaciones":
                 if tipo_op == "Venta / Instalación":
                     st.divider()
                     col_c, col_d = st.columns(2)
-                    
-                    # --- NUEVA LÓGICA DE CLIENTE ---
                     tipo_cliente = col_c.radio("¿Tipo de Cliente?", ["Público General", "Asegurado"], horizontal=True)
-                    
-                    # Campo para escribir nombre de aseguradora
                     nombre_aseguradora = col_c.text_input("Nombre Aseguradora (Si aplica):", placeholder="Ej: Qualitas, GNP...")
-                    
-                    # Nota Adicional
                     nota = st.text_input("Nota / Observaciones:")
                     prec = col_d.number_input("Precio Venta $", 0.0)
 
-                    # Construir el detalle automáticamente
                     if tipo_cliente == "Asegurado":
-                         # Si no escribe nada, ponemos "Asegurado" a secas
                          aseg_txt = nombre_aseguradora if nombre_aseguradora else "Asegurado"
                          detalle = f"Aseg: {aseg_txt} - {nota}"
                     else:
@@ -300,7 +308,9 @@ if menu == "📦 Operaciones":
     if not df_inventario.empty:
         st.dataframe(df_inventario, use_container_width=True, height=300)
 
+# ==========================================
 # PESTAÑA 2: TRASLADOS
+# ==========================================
 elif menu == "🚚 Traslados en Camino":
     st.title("Gestión de Traslados")
     if st.button("🔄 Actualizar Lista"): st.rerun()
@@ -354,7 +364,9 @@ elif menu == "🚚 Traslados en Camino":
                 df_enviados_mostrar['DESTINO'] = df_enviados_mostrar['DESTINO'].map(NOMBRES_SUCURSALES).fillna(df_enviados_mostrar['DESTINO'])
             st.dataframe(df_enviados_mostrar[['FECHA','DESTINO','CLAVE','CANTIDAD']], use_container_width=True)
 
+# ==========================================
 # PESTAÑA 3: RACK
+# ==========================================
 elif menu == "👀 Rack Visual":
     nombre_visual = NOMBRES_SUCURSALES.get(sucursal_visualizada, sucursal_visualizada)
     st.title(f"Visor - {nombre_visual}")
@@ -374,3 +386,45 @@ elif menu == "👀 Rack Visual":
             st.metric("Total Piezas en Rack", int(filtro_rack['CANTIDAD'].sum()))
     else:
         st.warning("Sin datos de Rack.")
+
+# ==========================================
+# PESTAÑA 4: HISTORIAL (SOLO ADMIN)
+# ==========================================
+elif menu == "📜 Historial de Movimientos":
+    st.title("📜 Historial Global de Movimientos")
+    
+    if st.button("🔄 Actualizar Historial"):
+        st.rerun()
+
+    # Leemos la hoja de Movimientos
+    try:
+        data_movs = hojas['Movimientos'].get_all_records()
+        df_movs = pd.DataFrame(data_movs)
+
+        if df_movs.empty:
+            st.info("No hay movimientos registrados todavía.")
+        else:
+            # Ordenar por fecha (asumiendo que la columna se llama 'FECHA')
+            # Intentamos convertir a datetime para ordenar correctamente
+            if 'FECHA' in df_movs.columns:
+                try:
+                    df_movs['FECHA_DT'] = pd.to_datetime(df_movs['FECHA'])
+                    df_movs = df_movs.sort_values(by='FECHA_DT', ascending=False)
+                    df_movs = df_movs.drop(columns=['FECHA_DT']) # Borramos la columna auxiliar
+                except:
+                    pass # Si falla el formato de fecha, se muestra como venga
+
+            # Mostramos la tabla ocupando todo el ancho
+            st.dataframe(df_movs, use_container_width=True)
+            
+            # Opción para descargar
+            csv = df_movs.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="💾 Descargar Historial como CSV",
+                data=csv,
+                file_name='historial_movimientos.csv',
+                mime='text/csv',
+            )
+
+    except Exception as e:
+        st.error(f"Error al cargar el historial: {e}")
