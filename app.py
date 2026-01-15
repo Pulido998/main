@@ -55,8 +55,12 @@ def obtener_fila_exacta(ws, clave, rack):
     rack = str(rack).upper().strip()
     
     if not df.empty:
-        df['CLAVE'] = df['CLAVE'].astype(str).str.upper().str.strip()
-        df['RACK'] = df['RACK'].astype(str).str.upper().str.strip()
+        # Aseguramos que existan las columnas y sean string
+        if 'CLAVE' in df.columns:
+            df['CLAVE'] = df['CLAVE'].astype(str).str.upper().str.strip()
+        if 'RACK' in df.columns:
+            df['RACK'] = df['RACK'].astype(str).str.upper().str.strip()
+            
         filtro = df[(df['CLAVE'] == clave) & (df['RACK'] == rack)]
         
         if not filtro.empty:
@@ -103,7 +107,6 @@ def iniciar_traslado(ws_origen, clave, rack, cantidad, suc_destino, usuario):
         
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         hojas['Traslados_Pendientes'].append_row([fecha, clave, nombre_prod, cantidad, ws_origen.title, suc_destino])
-        # Log en Movimientos
         hojas['Movimientos'].append_row([fecha, clave, "Envío Traslado", f"Desde {rack} a {NOMBRES_SUCURSALES.get(suc_destino, suc_destino)}", cantidad, 0, usuario, ws_origen.title])
 
         return True, f"✅ Enviado a tránsito. Quedan {nueva_cant} en {rack}."
@@ -128,7 +131,6 @@ def procesar_baja_venta(ws_origen, clave, rack, detalle, cantidad, precio, usuar
         ws_origen.update_cell(fila, 4, nueva_cant)
         
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Log en Movimientos
         hojas['Movimientos'].append_row([fecha, clave, "Venta/Instalación", f"{detalle} (Desde {rack})", cantidad, precio, usuario, ws_origen.title])
         
         return True, f"✅ Venta registrada desde {rack}. Quedan {nueva_cant}."
@@ -145,7 +147,6 @@ def finalizar_recepcion(suc_destino_nombre, clave, nombre, cantidad, rack, usuar
         if ok:
             hojas['Traslados_Pendientes'].delete_rows(fila_traslado)
             fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # Log en Movimientos
             hojas['Movimientos'].append_row([fecha, clave, "Recepción Traslado", "Recibido en sucursal", cantidad, 0, usuario, suc_destino_nombre])
             return True, msg
         else:
@@ -193,16 +194,13 @@ with st.sidebar:
         st.session_state.logueado = False
         st.rerun()
     
-    # Definimos las opciones del menú
     opciones_menu = ["📦 Operaciones", "🚚 Traslados en Camino", "👀 Rack Visual"]
-    
-    # Si es ADMIN, agregamos la opción de historial
     if rol == "admin":
         opciones_menu.append("📜 Historial de Movimientos")
         
     menu = st.radio("Menú", opciones_menu)
 
-# Lógica de visualización de inventario
+# Selección de hoja
 if rol == "admin":
     opciones_suc = ["Inventario_Suc1", "Inventario_Suc2", "Inventario_Suc3"]
     sucursal_visualizada = st.selectbox(
@@ -219,6 +217,8 @@ df_inventario = pd.DataFrame(ws_activo.get_all_records())
 if not df_inventario.empty:
     df_inventario['CLAVE'] = df_inventario['CLAVE'].astype(str).str.upper().str.strip()
     df_inventario['RACK'] = df_inventario['RACK'].astype(str).str.upper().str.strip()
+    if 'NOMBRE' in df_inventario.columns:
+        df_inventario['NOMBRE'] = df_inventario['NOMBRE'].astype(str)
 
 # ==========================================
 # PESTAÑA 1: OPERACIONES
@@ -304,9 +304,51 @@ if menu == "📦 Operaciones":
             st.info("Escribe una clave válida para ver los Racks disponibles.")
 
     st.divider()
-    st.subheader("📋 Inventario Actual")
+    # --- SECCIÓN DE INVENTARIO DIVIDIDO ---
+    st.markdown("### 📋 Inventario Actual")
+    
+    # 1. BUSCADOR GRANDE
+    st.markdown("#### 🔎 BUSCADOR DE PIEZAS")
+    busqueda = st.text_input("", placeholder="Escribe Clave, Nombre, Rack...", label_visibility="collapsed").upper()
+
     if not df_inventario.empty:
-        st.dataframe(df_inventario, use_container_width=True, height=300)
+        # 2. Filtrado general por buscador
+        df_final = df_inventario.copy()
+        if busqueda:
+            df_final = df_final[
+                df_final.astype(str).apply(lambda x: x.str.contains(busqueda, case=False)).any(axis=1)
+            ]
+
+        # 3. Pestañas separadas
+        tab1, tab2, tab3 = st.tabs(["🚘 PARABRISAS", "🔙 MEDALLONES", "🚪 PUERTAS / OTROS"])
+        
+        # Filtro por tipo de pieza (Columna 'NOMBRE')
+        # Asumiendo que 'NOMBRE' contiene 'Parabrisas', 'Medallón', 'Puerta', etc.
+        
+        with tab1:
+            df_p = df_final[df_final['NOMBRE'].str.contains("Parabrisas", case=False, na=False)]
+            st.dataframe(df_p, use_container_width=True, height=400)
+            st.caption(f"Total registros: {len(df_p)}")
+
+        with tab2:
+            df_m = df_final[df_final['NOMBRE'].str.contains("Medallón", case=False, na=False)]
+            st.dataframe(df_m, use_container_width=True, height=400)
+            st.caption(f"Total registros: {len(df_m)}")
+
+        with tab3:
+            # Aquí metemos Puertas, Aletas, Costados y cualquier otra cosa
+            # Filtramos lo que NO sea Parabrisas NI Medallón
+            mask_otros = (
+                ~df_final['NOMBRE'].str.contains("Parabrisas", case=False, na=False) & 
+                ~df_final['NOMBRE'].str.contains("Medallón", case=False, na=False)
+            )
+            df_o = df_final[mask_otros]
+            st.dataframe(df_o, use_container_width=True, height=400)
+            st.caption(f"Total registros: {len(df_o)}")
+
+    else:
+        st.info("El inventario está vacío.")
+
 
 # ==========================================
 # PESTAÑA 2: TRASLADOS
@@ -392,11 +434,8 @@ elif menu == "👀 Rack Visual":
 # ==========================================
 elif menu == "📜 Historial de Movimientos":
     st.title("📜 Historial Global de Movimientos")
-    
-    if st.button("🔄 Actualizar Historial"):
-        st.rerun()
+    if st.button("🔄 Actualizar Historial"): st.rerun()
 
-    # Leemos la hoja de Movimientos
     try:
         data_movs = hojas['Movimientos'].get_all_records()
         df_movs = pd.DataFrame(data_movs)
@@ -404,20 +443,14 @@ elif menu == "📜 Historial de Movimientos":
         if df_movs.empty:
             st.info("No hay movimientos registrados todavía.")
         else:
-            # Ordenar por fecha (asumiendo que la columna se llama 'FECHA')
-            # Intentamos convertir a datetime para ordenar correctamente
             if 'FECHA' in df_movs.columns:
                 try:
                     df_movs['FECHA_DT'] = pd.to_datetime(df_movs['FECHA'])
                     df_movs = df_movs.sort_values(by='FECHA_DT', ascending=False)
-                    df_movs = df_movs.drop(columns=['FECHA_DT']) # Borramos la columna auxiliar
-                except:
-                    pass # Si falla el formato de fecha, se muestra como venga
+                    df_movs = df_movs.drop(columns=['FECHA_DT'])
+                except: pass
 
-            # Mostramos la tabla ocupando todo el ancho
             st.dataframe(df_movs, use_container_width=True)
-            
-            # Opción para descargar
             csv = df_movs.to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="💾 Descargar Historial como CSV",
@@ -425,6 +458,5 @@ elif menu == "📜 Historial de Movimientos":
                 file_name='historial_movimientos.csv',
                 mime='text/csv',
             )
-
     except Exception as e:
         st.error(f"Error al cargar el historial: {e}")
