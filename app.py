@@ -55,7 +55,6 @@ def obtener_fila_exacta(ws, clave, rack):
     rack = str(rack).upper().strip()
     
     if not df.empty:
-        # Aseguramos que existan las columnas y sean string
         if 'CLAVE' in df.columns:
             df['CLAVE'] = df['CLAVE'].astype(str).str.upper().str.strip()
         if 'RACK' in df.columns:
@@ -80,7 +79,7 @@ def guardar_entrada(ws_destino, clave, nombre, rack, cantidad, usuario):
             nueva_cant = cant_actual + cantidad
             ws_destino.update_cell(fila, 4, nueva_cant)
             ws_destino.update_cell(fila, 5, fecha)
-            return True, f"✅ Recibido en Rack {rack}. Total: {nueva_cant}"
+            return True, f"✅ Recibido/Actualizado en Rack {rack}. Total: {nueva_cant}"
         else:
             ws_destino.append_row([clave, nombre, rack, cantidad, fecha])
             return True, f"✅ Nuevo registro creado en Rack {rack}."
@@ -97,7 +96,6 @@ def iniciar_traslado(ws_origen, clave, rack, cantidad, suc_destino, usuario):
         
         if not fila:
             return False, f"❌ No se encontró la clave {clave} en el rack {rack}."
-
         if cant_actual < cantidad:
             return False, f"❌ Stock insuficiente en Rack {rack}. Tienes: {cant_actual}"
 
@@ -113,6 +111,42 @@ def iniciar_traslado(ws_origen, clave, rack, cantidad, suc_destino, usuario):
     except Exception as e:
         return False, f"Error: {e}"
 
+def mover_interno_rack(ws, clave, nombre, rack_origen, rack_destino, cantidad, usuario):
+    """Función para cambiar de rack dentro de la misma sucursal"""
+    try:
+        clave = str(clave).upper().strip()
+        rack_origen = str(rack_origen).upper().strip()
+        rack_destino = str(rack_destino).upper().strip()
+        cantidad = int(cantidad)
+
+        if rack_origen == rack_destino:
+            return False, "❌ El rack de destino es igual al de origen."
+
+        # 1. Restar del origen
+        fila_origen, cant_origen = obtener_fila_exacta(ws, clave, rack_origen)
+        if not fila_origen or cant_origen < cantidad:
+            return False, "❌ Stock insuficiente en origen."
+
+        nueva_cant_origen = cant_origen - cantidad
+        ws.update_cell(fila_origen, 4, nueva_cant_origen)
+
+        # 2. Sumar al destino (o crear)
+        fila_destino, cant_destino = obtener_fila_exacta(ws, clave, rack_destino)
+        if fila_destino:
+            ws.update_cell(fila_destino, 4, cant_destino + cantidad)
+        else:
+            fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ws.append_row([clave, nombre, rack_destino, cantidad, fecha])
+        
+        # 3. Log
+        fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        hojas['Movimientos'].append_row([fecha, clave, "Reubicación Interna", f"De {rack_origen} a {rack_destino}", cantidad, 0, usuario, ws.title])
+
+        return True, f"✅ Reubicado: {cantidad} pz de {rack_origen} a {rack_destino}."
+
+    except Exception as e:
+        return False, f"Error moviendo: {e}"
+
 def procesar_baja_venta(ws_origen, clave, rack, detalle, cantidad, precio, usuario):
     try:
         clave = str(clave).upper().strip()
@@ -123,7 +157,6 @@ def procesar_baja_venta(ws_origen, clave, rack, detalle, cantidad, precio, usuar
         
         if not fila:
             return False, f"❌ No se encontró la clave {clave} en el rack {rack}."
-        
         if cant_actual < cantidad:
             return False, f"❌ Stock insuficiente en {rack}. Tienes: {cant_actual}"
         
@@ -176,7 +209,6 @@ if not st.session_state.logueado:
     st.stop()
 
 # --- INTERFAZ PRINCIPAL ---
-
 if "user_data" not in st.session_state:
     st.session_state.logueado = False
     st.rerun()
@@ -185,15 +217,16 @@ usuario = st.session_state.user_data["user"]
 rol = st.session_state.user_data["rol"]
 sucursal_asignada = st.session_state.user_data["sucursal"]
 
-# --- BARRA LATERAL ---
 with st.sidebar:
     nombre_visual_sucursal = NOMBRES_SUCURSALES.get(sucursal_asignada, sucursal_asignada)
     st.header(f"🏢 {nombre_visual_sucursal}")
     st.caption(f"Usuario: {usuario}")
-    if st.button("Cerrar Sesión"):
+    
+    if st.button("🚪 Cerrar Sesión"):
         st.session_state.logueado = False
         st.rerun()
     
+    st.markdown("---")
     opciones_menu = ["📦 Operaciones", "🚚 Traslados en Camino", "👀 Rack Visual"]
     if rol == "admin":
         opciones_menu.append("📜 Historial de Movimientos")
@@ -224,20 +257,30 @@ if not df_inventario.empty:
 # PESTAÑA 1: OPERACIONES
 # ==========================================
 if menu == "📦 Operaciones":
-    st.title("Operaciones de Inventario")
+    
+    col_t1, col_t2 = st.columns([3,1])
+    with col_t1:
+        st.title("Operaciones de Inventario")
+    with col_t2:
+        # BOTÓN DE REFRESCAR GLOBAL
+        if st.button("🔄 ACTUALIZAR DATOS", type="primary"):
+            st.rerun()
 
     # --- SECCIÓN ALTA ---
     with st.expander("➕ ALTA (Compra/Material Nuevo)", expanded=False):
         with st.form("form_alta", clear_on_submit=True):
             col1, col2 = st.columns(2)
-            c_clave = col1.text_input("Clave")
+            c_clave = col1.text_input("Clave").upper().strip()
             c_pieza = col2.selectbox("Pieza", ["Parabrisas", "Medallón", "Puerta", "Aleta", "Costado"])
-            c_rack = col1.text_input("Ubicación / Rack", "PISO")
+            c_rack = col1.text_input("Ubicación / Rack", "PISO").upper().strip()
             c_cant = col2.number_input("Cantidad", 1, 100, 1)
-            if st.form_submit_button("💾 Guardar"):
+            if st.form_submit_button("💾 Guardar Entrada"):
                 if c_clave:
                     ok, txt = guardar_entrada(ws_activo, c_clave, c_pieza, c_rack, c_cant, usuario)
-                    if ok: st.success(txt)
+                    if ok: 
+                        st.success(txt)
+                        time.sleep(1)
+                        st.rerun()
                     else: st.error(txt)
                 else: st.warning("Falta clave.")
 
@@ -300,55 +343,78 @@ if menu == "📦 Operaciones":
                     st.rerun()
                 elif msg: 
                     st.error(msg)
-        elif b_clave_input:
-            st.info("Escribe una clave válida para ver los Racks disponibles.")
 
     st.divider()
-    # --- SECCIÓN DE INVENTARIO DIVIDIDO ---
+    
+    # --- BUSCADOR Y GESTIÓN RÁPIDA (REUBICACIÓN) ---
     st.markdown("### 📋 Inventario Actual")
     
-    # 1. BUSCADOR GRANDE
-    st.markdown("#### 🔎 BUSCADOR DE PIEZAS")
+    st.markdown("#### 🔎 BUSCADOR DE PIEZAS Y GESTIÓN")
+    st.caption("Escribe para ver opciones de reubicación.")
     busqueda = st.text_input("", placeholder="Escribe Clave, Nombre, Rack...", label_visibility="collapsed").upper()
 
     if not df_inventario.empty:
-        # 2. Filtrado general por buscador
         df_final = df_inventario.copy()
+        
+        # 1. SI HAY BÚSQUEDA: MOSTRAR OPCIONES DE GESTIÓN (REUBICACIÓN)
         if busqueda:
             df_final = df_final[
                 df_final.astype(str).apply(lambda x: x.str.contains(busqueda, case=False)).any(axis=1)
             ]
+            
+            st.info(f"Encontrados: {len(df_final)} registros. (Usa los botones abajo para mover de rack)")
+            
+            # Mostramos tarjetas para reubicación (Limitado a 10 para no trabar)
+            for idx, row in df_final.head(10).iterrows():
+                with st.container():
+                    col_info, col_move = st.columns([2, 2])
+                    with col_info:
+                        st.markdown(f"**{row['CLAVE']}** - {row['NOMBRE']}")
+                        st.markdown(f"📍 Ubicación actual: **{row['RACK']}** | Stock: **{row['CANTIDAD']}**")
+                    
+                    with col_move:
+                        # Solo permitir mover si hay existencias
+                        if int(row['CANTIDAD']) > 0:
+                            with st.expander(f"🛠️ Cambiar de Rack ({row['RACK']})"):
+                                with st.form(f"move_{idx}"):
+                                    nuevo_rack = st.text_input("Nuevo Rack:", placeholder="Ej. A-02").upper().strip()
+                                    cant_mover = st.number_input("Cantidad a mover:", 1, int(row['CANTIDAD']), 1, key=f"n_{idx}")
+                                    if st.form_submit_button("Mover Pieza"):
+                                        if nuevo_rack and nuevo_rack != row['RACK']:
+                                            ok, txt = mover_interno_rack(ws_activo, row['CLAVE'], row['NOMBRE'], row['RACK'], nuevo_rack, cant_mover, usuario)
+                                            if ok:
+                                                st.success(txt)
+                                                time.sleep(1)
+                                                st.rerun()
+                                            else:
+                                                st.error(txt)
+                                        else:
+                                            st.warning("Indica un rack destino diferente.")
+                        else:
+                            st.caption("Sin stock para mover.")
+                    st.divider()
 
-        # 3. Pestañas separadas
+        # 2. PESTAÑAS SEPARADAS (Solo vista)
         tab1, tab2, tab3 = st.tabs(["🚘 PARABRISAS", "🔙 MEDALLONES", "🚪 PUERTAS / OTROS"])
-        
-        # Filtro por tipo de pieza (Columna 'NOMBRE')
-        # Asumiendo que 'NOMBRE' contiene 'Parabrisas', 'Medallón', 'Puerta', etc.
         
         with tab1:
             df_p = df_final[df_final['NOMBRE'].str.contains("Parabrisas", case=False, na=False)]
             st.dataframe(df_p, use_container_width=True, height=400)
-            st.caption(f"Total registros: {len(df_p)}")
 
         with tab2:
             df_m = df_final[df_final['NOMBRE'].str.contains("Medallón", case=False, na=False)]
             st.dataframe(df_m, use_container_width=True, height=400)
-            st.caption(f"Total registros: {len(df_m)}")
 
         with tab3:
-            # Aquí metemos Puertas, Aletas, Costados y cualquier otra cosa
-            # Filtramos lo que NO sea Parabrisas NI Medallón
             mask_otros = (
                 ~df_final['NOMBRE'].str.contains("Parabrisas", case=False, na=False) & 
                 ~df_final['NOMBRE'].str.contains("Medallón", case=False, na=False)
             )
             df_o = df_final[mask_otros]
             st.dataframe(df_o, use_container_width=True, height=400)
-            st.caption(f"Total registros: {len(df_o)}")
 
     else:
         st.info("El inventario está vacío.")
-
 
 # ==========================================
 # PESTAÑA 2: TRASLADOS
