@@ -48,92 +48,111 @@ credenciales = {
 
 # --- FUNCIONES DE LÓGICA ---
 
+def limpiar_texto(texto):
+    """
+    Normaliza el texto para evitar duplicados por errores de dedo.
+    Ejemplo: ' FW711   GBN ' -> 'FW711 GBN' (Quita espacios extra y dobles espacios)
+    """
+    if not texto:
+        return ""
+    texto_str = str(texto).upper()
+    # " ".join(split()) quita todos los espacios repetidos en medio
+    return " ".join(texto_str.split())
+
 def obtener_fila_exacta(ws, clave, rack):
     """
-    Busca la fila exacta. Si hay duplicados, prioriza la fila que tenga MAYOR cantidad.
+    Busca la fila exacta.
+    MEJORA: Aplica limpieza rigurosa para encontrar la clave aunque tenga 0 stock.
     """
     data = ws.get_all_records()
     df = pd.DataFrame(data)
-    clave = str(clave).upper().strip()
-    rack = str(rack).upper().strip()
+    
+    # Limpiamos los inputs
+    clave_limpia = limpiar_texto(clave)
+    rack_limpio = limpiar_texto(rack)
     
     if not df.empty:
+        # Limpiamos las columnas del DataFrame para comparar manzanas con manzanas
         if 'CLAVE' in df.columns:
-            df['CLAVE'] = df['CLAVE'].astype(str).str.upper().str.strip()
+            df['CLAVE'] = df['CLAVE'].astype(str).apply(limpiar_texto)
         if 'RACK' in df.columns:
-            df['RACK'] = df['RACK'].astype(str).str.upper().str.strip()
+            df['RACK'] = df['RACK'].astype(str).apply(limpiar_texto)
         if 'CANTIDAD' in df.columns:
-             # Aseguramos que CANTIDAD sea numérico para poder ordenar
             df['CANTIDAD'] = pd.to_numeric(df['CANTIDAD'], errors='coerce').fillna(0)
             
-        filtro = df[(df['CLAVE'] == clave) & (df['RACK'] == rack)]
+        # Filtramos buscando coincidencia exacta
+        filtro = df[(df['CLAVE'] == clave_limpia) & (df['RACK'] == rack_limpio)]
         
         if not filtro.empty:
-            # CORRECCIÓN AQUÍ: Ordenamos descendente por cantidad.
-            # Así tomamos siempre la fila que tiene stock, ignorando la de 0 si existe duplicada.
+            # Si hay más de una fila (error de duplicado anterior), priorizamos la que tiene stock
             filtro = filtro.sort_values(by='CANTIDAD', ascending=False)
             
+            # Devolvemos el índice real de Google Sheets (index + 2)
             return filtro.index[0] + 2, int(filtro.iloc[0]['CANTIDAD'])
+            
     return None, 0
 
 def guardar_entrada(ws_destino, clave, nombre, rack, cantidad, usuario):
     fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        clave = str(clave).upper().strip()
-        rack = str(rack).upper().strip()
+        # Usamos la función de limpieza
+        clave_clean = limpiar_texto(clave)
+        rack_clean = limpiar_texto(rack)
         cantidad = int(cantidad) 
         
-        fila, cant_actual = obtener_fila_exacta(ws_destino, clave, rack)
+        # Buscamos si YA EXISTE esa combinación Clave+Rack
+        fila, cant_actual = obtener_fila_exacta(ws_destino, clave_clean, rack_clean)
 
         if fila:
+            # SI EXISTE (Incluso si cantidad es 0): Actualizamos, NO creamos nueva.
             nueva_cant = cant_actual + cantidad
             ws_destino.update_cell(fila, 4, nueva_cant)
             ws_destino.update_cell(fila, 5, fecha)
-            return True, f"✅ Recibido/Actualizado en Rack {rack}. Total: {nueva_cant}"
+            return True, f"✅ Actualizado en Rack {rack_clean}. (Antes: {cant_actual} -> Ahora: {nueva_cant})"
         else:
-            ws_destino.append_row([clave, nombre, rack, cantidad, fecha])
-            return True, f"✅ Nuevo registro creado en Rack {rack}."
+            # SI NO EXISTE: Creamos fila nueva
+            ws_destino.append_row([clave_clean, nombre, rack_clean, cantidad, fecha])
+            return True, f"✅ Nuevo registro creado en Rack {rack_clean}."
     except Exception as e:
         return False, f"Error técnico en guardar: {e}"
 
 def iniciar_traslado(ws_origen, clave, rack, cantidad, suc_destino, usuario):
     try:
-        clave = str(clave).upper().strip()
-        rack = str(rack).upper().strip()
+        clave_clean = limpiar_texto(clave)
+        rack_clean = limpiar_texto(rack)
         cantidad = int(cantidad)
         
-        fila, cant_actual = obtener_fila_exacta(ws_origen, clave, rack)
+        fila, cant_actual = obtener_fila_exacta(ws_origen, clave_clean, rack_clean)
         
         if not fila:
-            return False, f"❌ No se encontró la clave {clave} en el rack {rack}."
+            return False, f"❌ No se encontró la clave {clave_clean} en el rack {rack_clean}."
         if cant_actual < cantidad:
-            return False, f"❌ Stock insuficiente en Rack {rack}. Tienes: {cant_actual}"
+            return False, f"❌ Stock insuficiente en Rack {rack_clean}. Tienes: {cant_actual}"
 
         nombre_prod = ws_origen.cell(fila, 2).value 
         nueva_cant = cant_actual - cantidad
         ws_origen.update_cell(fila, 4, nueva_cant)
         
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        hojas['Traslados_Pendientes'].append_row([fecha, clave, nombre_prod, cantidad, ws_origen.title, suc_destino])
-        hojas['Movimientos'].append_row([fecha, clave, "Envío Traslado", f"Desde {rack} a {NOMBRES_SUCURSALES.get(suc_destino, suc_destino)}", cantidad, 0, usuario, ws_origen.title])
+        hojas['Traslados_Pendientes'].append_row([fecha, clave_clean, nombre_prod, cantidad, ws_origen.title, suc_destino])
+        hojas['Movimientos'].append_row([fecha, clave_clean, "Envío Traslado", f"Desde {rack_clean} a {NOMBRES_SUCURSALES.get(suc_destino, suc_destino)}", cantidad, 0, usuario, ws_origen.title])
 
-        return True, f"✅ Enviado a tránsito. Quedan {nueva_cant} en {rack}."
+        return True, f"✅ Enviado a tránsito. Quedan {nueva_cant} en {rack_clean}."
     except Exception as e:
         return False, f"Error: {e}"
 
 def mover_interno_rack(ws, clave, nombre, rack_origen, rack_destino, cantidad, usuario):
-    """Función para cambiar de rack dentro de la misma sucursal"""
     try:
-        clave = str(clave).upper().strip()
-        rack_origen = str(rack_origen).upper().strip()
-        rack_destino = str(rack_destino).upper().strip()
+        clave_clean = limpiar_texto(clave)
+        rack_origen_clean = limpiar_texto(rack_origen)
+        rack_destino_clean = limpiar_texto(rack_destino)
         cantidad = int(cantidad)
 
-        if rack_origen == rack_destino:
+        if rack_origen_clean == rack_destino_clean:
             return False, "❌ El rack de destino es igual al de origen."
 
         # 1. Restar del origen
-        fila_origen, cant_origen = obtener_fila_exacta(ws, clave, rack_origen)
+        fila_origen, cant_origen = obtener_fila_exacta(ws, clave_clean, rack_origen_clean)
         if not fila_origen or cant_origen < cantidad:
             return False, "❌ Stock insuficiente en origen."
 
@@ -141,42 +160,42 @@ def mover_interno_rack(ws, clave, nombre, rack_origen, rack_destino, cantidad, u
         ws.update_cell(fila_origen, 4, nueva_cant_origen)
 
         # 2. Sumar al destino (o crear)
-        fila_destino, cant_destino = obtener_fila_exacta(ws, clave, rack_destino)
+        # Aquí también usamos la lógica de NO duplicar
+        fila_destino, cant_destino = obtener_fila_exacta(ws, clave_clean, rack_destino_clean)
         if fila_destino:
             ws.update_cell(fila_destino, 4, cant_destino + cantidad)
         else:
             fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ws.append_row([clave, nombre, rack_destino, cantidad, fecha])
+            ws.append_row([clave_clean, nombre, rack_destino_clean, cantidad, fecha])
         
-        # 3. Log
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        hojas['Movimientos'].append_row([fecha, clave, "Reubicación Interna", f"De {rack_origen} a {rack_destino}", cantidad, 0, usuario, ws.title])
+        hojas['Movimientos'].append_row([fecha, clave_clean, "Reubicación Interna", f"De {rack_origen_clean} a {rack_destino_clean}", cantidad, 0, usuario, ws.title])
 
-        return True, f"✅ Reubicado: {cantidad} pz de {rack_origen} a {rack_destino}."
+        return True, f"✅ Reubicado: {cantidad} pz de {rack_origen_clean} a {rack_destino_clean}."
 
     except Exception as e:
         return False, f"Error moviendo: {e}"
 
 def procesar_baja_venta(ws_origen, clave, rack, detalle, cantidad, precio, usuario):
     try:
-        clave = str(clave).upper().strip()
-        rack = str(rack).upper().strip()
+        clave_clean = limpiar_texto(clave)
+        rack_clean = limpiar_texto(rack)
         cantidad = int(cantidad)
         
-        fila, cant_actual = obtener_fila_exacta(ws_origen, clave, rack)
+        fila, cant_actual = obtener_fila_exacta(ws_origen, clave_clean, rack_clean)
         
         if not fila:
-            return False, f"❌ No se encontró la clave {clave} en el rack {rack}."
+            return False, f"❌ No se encontró la clave {clave_clean} en el rack {rack_clean}."
         if cant_actual < cantidad:
-            return False, f"❌ Stock insuficiente en {rack}. Tienes: {cant_actual}"
+            return False, f"❌ Stock insuficiente en {rack_clean}. Tienes: {cant_actual}"
         
         nueva_cant = cant_actual - cantidad
         ws_origen.update_cell(fila, 4, nueva_cant)
         
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        hojas['Movimientos'].append_row([fecha, clave, "Venta/Instalación", f"{detalle} (Desde {rack})", cantidad, precio, usuario, ws_origen.title])
+        hojas['Movimientos'].append_row([fecha, clave_clean, "Venta/Instalación", f"{detalle} (Desde {rack_clean})", cantidad, precio, usuario, ws_origen.title])
         
-        return True, f"✅ Venta registrada desde {rack}. Quedan {nueva_cant}."
+        return True, f"✅ Venta registrada desde {rack_clean}. Quedan {nueva_cant}."
     except Exception as e:
         return False, f"Error: {e}"
 
@@ -185,6 +204,8 @@ def finalizar_recepcion(suc_destino_nombre, clave, nombre, cantidad, rack, usuar
         cantidad = int(cantidad)
         fila_traslado = int(fila_traslado)
         ws_local = hojas[suc_destino_nombre]
+        
+        # Aquí reutilizamos guardar_entrada que ya tiene la protección anti-duplicados
         ok, msg = guardar_entrada(ws_local, clave, nombre, rack, cantidad, usuario)
         
         if ok:
@@ -258,8 +279,11 @@ else:
 # Pre-carga de inventario
 df_inventario = pd.DataFrame(ws_activo.get_all_records())
 if not df_inventario.empty:
-    df_inventario['CLAVE'] = df_inventario['CLAVE'].astype(str).str.upper().str.strip()
-    df_inventario['RACK'] = df_inventario['RACK'].astype(str).str.upper().str.strip()
+    # APLICAMOS LIMPIEZA AL DATAFRAME VISUAL TAMBIÉN
+    if 'CLAVE' in df_inventario.columns:
+        df_inventario['CLAVE'] = df_inventario['CLAVE'].apply(limpiar_texto)
+    if 'RACK' in df_inventario.columns:
+        df_inventario['RACK'] = df_inventario['RACK'].apply(limpiar_texto)
     if 'NOMBRE' in df_inventario.columns:
         df_inventario['NOMBRE'] = df_inventario['NOMBRE'].astype(str)
 
@@ -272,7 +296,6 @@ if menu == "📦 Operaciones":
     with col_t1:
         st.title("Operaciones de Inventario")
     with col_t2:
-        # BOTÓN DE REFRESCAR GLOBAL
         if st.button("🔄 ACTUALIZAR DATOS", type="primary"):
             st.rerun()
 
@@ -280,12 +303,15 @@ if menu == "📦 Operaciones":
     with st.expander("➕ ALTA (Compra/Material Nuevo)", expanded=False):
         with st.form("form_alta", clear_on_submit=True):
             col1, col2 = st.columns(2)
-            c_clave = col1.text_input("Clave").upper().strip()
+            # Aplicamos upper() aquí para visualización, pero limpiar_texto lo hará internamente al guardar
+            c_clave = col1.text_input("Clave").upper()
             c_pieza = col2.selectbox("Pieza", ["Parabrisas", "Medallón", "Puerta", "Aleta", "Costado"])
-            c_rack = col1.text_input("Ubicación / Rack", "PISO").upper().strip()
+            c_rack = col1.text_input("Ubicación / Rack", "PISO").upper()
             c_cant = col2.number_input("Cantidad", 1, 100, 1)
+            
             if st.form_submit_button("💾 Guardar Entrada"):
                 if c_clave:
+                    # Guardar entrada ya usa "limpiar_texto" dentro
                     ok, txt = guardar_entrada(ws_activo, c_clave, c_pieza, c_rack, c_cant, usuario)
                     if ok: 
                         st.success(txt)
@@ -297,11 +323,15 @@ if menu == "📦 Operaciones":
     # --- SECCIÓN BAJA/TRASLADO ---
     with st.expander("➖ BAJA (Venta) o ENVÍO (Traslado)", expanded=True):
         st.write("**Paso 1: Buscar Producto**")
-        b_clave_input = st.text_input("🔍 Ingresa Clave del producto:", placeholder="Ej. DW01234").upper().strip()
+        b_clave_input = st.text_input("🔍 Ingresa Clave del producto:", placeholder="Ej. DW01234").upper()
+        
+        # Limpiamos el input de búsqueda también para coincidir
+        b_clave_clean = limpiar_texto(b_clave_input)
         
         racks_disponibles = []
-        if b_clave_input and not df_inventario.empty:
-            filtro_prod = df_inventario[df_inventario['CLAVE'] == b_clave_input]
+        if b_clave_clean and not df_inventario.empty:
+            # Buscamos usando la clave limpia
+            filtro_prod = df_inventario[df_inventario['CLAVE'] == b_clave_clean]
             if not filtro_prod.empty:
                 racks_disponibles = [f"{row['RACK']} (Disp: {row['CANTIDAD']})" for i, row in filtro_prod.iterrows()]
             else:
@@ -335,7 +365,7 @@ if menu == "📦 Operaciones":
                          detalle = f"Público Gral - {nota}"
                     
                     if st.form_submit_button("💰 Confirmar Venta", type="primary"):
-                        ok, msg = procesar_baja_venta(ws_activo, b_clave_input, rack_real, detalle, cant_baja, prec, usuario)
+                        ok, msg = procesar_baja_venta(ws_activo, b_clave_clean, rack_real, detalle, cant_baja, prec, usuario)
                         
                 else: # Traslado
                     st.divider()
@@ -345,7 +375,7 @@ if menu == "📦 Operaciones":
                     destino = st.selectbox("Enviar a:", otras, format_func=lambda x: NOMBRES_SUCURSALES.get(x, x))
                     
                     if st.form_submit_button("🚚 Enviar Traslado", type="primary"):
-                        ok, msg = iniciar_traslado(ws_activo, b_clave_input, rack_real, cant_baja, destino, usuario)
+                        ok, msg = iniciar_traslado(ws_activo, b_clave_clean, rack_real, cant_baja, destino, usuario)
 
                 if ok: 
                     st.success(msg)
@@ -361,13 +391,15 @@ if menu == "📦 Operaciones":
     
     st.markdown("#### 🔎 BUSCADOR DE PIEZAS Y GESTIÓN")
     st.caption("Escribe para ver opciones de reubicación.")
-    busqueda = st.text_input("", placeholder="Escribe Clave, Nombre, Rack...", label_visibility="collapsed").upper()
+    busqueda_raw = st.text_input("", placeholder="Escribe Clave, Nombre, Rack...", label_visibility="collapsed").upper()
+    busqueda = limpiar_texto(busqueda_raw)
 
     if not df_inventario.empty:
         df_final = df_inventario.copy()
         
         # 1. SI HAY BÚSQUEDA: MOSTRAR OPCIONES DE GESTIÓN (REUBICACIÓN)
         if busqueda:
+            # Búsqueda un poco más flexible (contains)
             df_final = df_final[
                 df_final.astype(str).apply(lambda x: x.str.contains(busqueda, case=False)).any(axis=1)
             ]
@@ -387,10 +419,10 @@ if menu == "📦 Operaciones":
                         if int(row['CANTIDAD']) > 0:
                             with st.expander(f"🛠️ Cambiar de Rack ({row['RACK']})"):
                                 with st.form(f"move_{idx}"):
-                                    nuevo_rack = st.text_input("Nuevo Rack:", placeholder="Ej. A-02").upper().strip()
+                                    nuevo_rack = st.text_input("Nuevo Rack:", placeholder="Ej. A-02").upper()
                                     cant_mover = st.number_input("Cantidad a mover:", 1, int(row['CANTIDAD']), 1, key=f"n_{idx}")
                                     if st.form_submit_button("Mover Pieza"):
-                                        if nuevo_rack and nuevo_rack != row['RACK']:
+                                        if nuevo_rack and limpiar_texto(nuevo_rack) != row['RACK']:
                                             ok, txt = mover_interno_rack(ws_activo, row['CLAVE'], row['NOMBRE'], row['RACK'], nuevo_rack, cant_mover, usuario)
                                             if ok:
                                                 st.success(txt)
@@ -492,16 +524,22 @@ elif menu == "👀 Rack Visual":
     
     df = pd.DataFrame(ws_activo.get_all_records())
     if not df.empty and 'RACK' in df.columns:
-        df['RACK'] = df['RACK'].astype(str).str.upper().str.strip()
+        # Aplicar limpieza para que se vea bonito en el visor también
+        df['RACK'] = df['RACK'].apply(limpiar_texto)
+        
         racks = sorted(df['RACK'].unique().tolist())
         col_r1, col_r2 = st.columns([1, 3])
         with col_r1:
-            sel = st.radio("Selecciona Rack:", racks)
+            if racks:
+                sel = st.radio("Selecciona Rack:", racks)
+            else:
+                sel = None
         with col_r2:
-            st.subheader(f"Contenido Rack: {sel}")
-            filtro_rack = df[df['RACK'] == sel]
-            st.dataframe(filtro_rack[['CLAVE','NOMBRE','CANTIDAD']], use_container_width=True)
-            st.metric("Total Piezas en Rack", int(filtro_rack['CANTIDAD'].sum()))
+            if sel:
+                st.subheader(f"Contenido Rack: {sel}")
+                filtro_rack = df[df['RACK'] == sel]
+                st.dataframe(filtro_rack[['CLAVE','NOMBRE','CANTIDAD']], use_container_width=True)
+                st.metric("Total Piezas en Rack", int(filtro_rack['CANTIDAD'].sum()))
     else:
         st.warning("Sin datos de Rack.")
 
