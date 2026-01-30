@@ -127,28 +127,20 @@ def iniciar_traslado(ws_origen, clave, rack, cantidad, suc_destino, usuario):
     except Exception as e:
         return False, f"Error: {e}"
 
-# --- FUNCIÓN MEJORADA: CANCELAR TRASLADO SEGURO ---
 def cancelar_traslado_seguro(ws_origen, item_data, rack_retorno, usuario):
-    """
-    Busca la fila exacta por FECHA y CLAVE para asegurar que sigue pendiente.
-    Si la encuentra, la borra y regresa el stock.
-    """
     try:
-        # 1. Volver a leer la hoja de pendientes en tiempo real
         data_pendientes = hojas['Traslados_Pendientes'].get_all_records()
         df_p = pd.DataFrame(data_pendientes)
         
         if df_p.empty:
             return False, "❌ La lista de pendientes está vacía. Seguramente ya fue aceptado."
 
-        # Convertimos a string para comparar fechas exactas
         df_p['FECHA'] = df_p['FECHA'].astype(str)
         df_p['CLAVE'] = df_p['CLAVE'].astype(str)
         
         fecha_buscada = str(item_data['FECHA'])
         clave_buscada = str(item_data['CLAVE'])
         
-        # Buscamos la fila exacta
         match = df_p[
             (df_p['FECHA'] == fecha_buscada) & 
             (df_p['CLAVE'] == clave_buscada)
@@ -157,21 +149,15 @@ def cancelar_traslado_seguro(ws_origen, item_data, rack_retorno, usuario):
         if match.empty:
             return False, "❌ ERROR: Esta pieza ya no está en pendientes. Es probable que la otra sucursal la acabara de aceptar."
             
-        # Obtenemos el índice real para borrar
         fila_real_borrar = match.index[0] + 2
         cantidad = int(item_data['CANTIDAD'])
 
-        # 2. Regresar pieza al inventario
         ok, msg = guardar_entrada(ws_origen, item_data['CLAVE'], item_data['NOMBRE'], rack_retorno, cantidad, usuario)
         
         if ok:
-            # 3. Borrar de pendientes SOLO si se guardó bien
             hojas['Traslados_Pendientes'].delete_rows(fila_real_borrar)
-            
-            # Log
             fecha_log = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             hojas['Movimientos'].append_row([fecha_log, item_data['CLAVE'], "Cancelación Traslado", f"Regresado a {rack_retorno}", cantidad, 0, usuario, ws_origen.title])
-            
             return True, "✅ Traslado cancelado correctamente y material recuperado."
         else:
             return False, f"Error al restaurar inventario: {msg}"
@@ -217,7 +203,8 @@ def procesar_baja_venta(ws_origen, clave, rack, detalle, cantidad, precio, usuar
         if not fila: return False, f"❌ No se encontró la clave {clave_clean} en {rack_clean}."
         if cant_actual < cantidad: return False, f"❌ Stock insuficiente en {rack_clean}. Tienes: {cant_actual}"
         
-        ws.update_cell(fila, 4, cant_actual - cantidad)
+        # --- AQUÍ ESTABA EL ERROR, YA CORREGIDO (ws_origen) ---
+        ws_origen.update_cell(fila, 4, cant_actual - cantidad)
         
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         hojas['Movimientos'].append_row([fecha, clave_clean, "Venta/Instalación", f"{detalle} (Desde {rack_clean})", cantidad, precio, usuario, ws_origen.title])
