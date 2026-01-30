@@ -55,34 +55,24 @@ def limpiar_texto(texto):
     return " ".join(str(texto).strip().upper().split())
 
 def obtener_fila_exacta(ws, clave, rack):
-    """
-    Busca si YA EXISTE esa clave en ese rack.
-    Si hay duplicados, selecciona la mejor fila (la que tenga stock) para usar esa.
-    """
     data = ws.get_all_records()
     df = pd.DataFrame(data)
     
     clave_buscada = limpiar_texto(clave)
     rack_buscado = limpiar_texto(rack)
     
-    if df.empty:
-        return None, 0
+    if df.empty: return None, 0
 
-    if 'CLAVE' in df.columns:
-        df['CLAVE_CLEAN'] = df['CLAVE'].apply(limpiar_texto)
+    if 'CLAVE' in df.columns: df['CLAVE_CLEAN'] = df['CLAVE'].apply(limpiar_texto)
     else: return None, 0
 
-    if 'RACK' in df.columns:
-        df['RACK_CLEAN'] = df['RACK'].apply(limpiar_texto)
+    if 'RACK' in df.columns: df['RACK_CLEAN'] = df['RACK'].apply(limpiar_texto)
     else: return None, 0
         
     if 'CANTIDAD' in df.columns:
         df['CANTIDAD'] = pd.to_numeric(df['CANTIDAD'], errors='coerce').fillna(0)
     
-    filtro = df[
-        (df['CLAVE_CLEAN'] == clave_buscada) & 
-        (df['RACK_CLEAN'] == rack_buscado)
-    ]
+    filtro = df[(df['CLAVE_CLEAN'] == clave_buscada) & (df['RACK_CLEAN'] == rack_buscado)]
     
     if not filtro.empty:
         filtro = filtro.sort_values(by='CANTIDAD', ascending=False)
@@ -137,30 +127,57 @@ def iniciar_traslado(ws_origen, clave, rack, cantidad, suc_destino, usuario):
     except Exception as e:
         return False, f"Error: {e}"
 
-# --- NUEVA FUNCIÓN: CANCELAR TRASLADO ---
-def cancelar_traslado(ws_origen, clave, nombre, cantidad, rack_retorno, fila_traslado, usuario):
-    """Devuelve la pieza al inventario origen y borra el traslado pendiente"""
+# --- FUNCIÓN MEJORADA: CANCELAR TRASLADO SEGURO ---
+def cancelar_traslado_seguro(ws_origen, item_data, rack_retorno, usuario):
+    """
+    Busca la fila exacta por FECHA y CLAVE para asegurar que sigue pendiente.
+    Si la encuentra, la borra y regresa el stock.
+    """
     try:
-        cantidad = int(cantidad)
-        fila_traslado = int(fila_traslado)
+        # 1. Volver a leer la hoja de pendientes en tiempo real
+        data_pendientes = hojas['Traslados_Pendientes'].get_all_records()
+        df_p = pd.DataFrame(data_pendientes)
         
-        # 1. Regresamos la pieza al inventario (usamos guardar_entrada para reciclar lógica)
-        ok, msg = guardar_entrada(ws_origen, clave, nombre, rack_retorno, cantidad, usuario)
+        if df_p.empty:
+            return False, "❌ La lista de pendientes está vacía. Seguramente ya fue aceptado."
+
+        # Convertimos a string para comparar fechas exactas
+        df_p['FECHA'] = df_p['FECHA'].astype(str)
+        df_p['CLAVE'] = df_p['CLAVE'].astype(str)
+        
+        fecha_buscada = str(item_data['FECHA'])
+        clave_buscada = str(item_data['CLAVE'])
+        
+        # Buscamos la fila exacta
+        match = df_p[
+            (df_p['FECHA'] == fecha_buscada) & 
+            (df_p['CLAVE'] == clave_buscada)
+        ]
+        
+        if match.empty:
+            return False, "❌ ERROR: Esta pieza ya no está en pendientes. Es probable que la otra sucursal la acabara de aceptar."
+            
+        # Obtenemos el índice real para borrar
+        fila_real_borrar = match.index[0] + 2
+        cantidad = int(item_data['CANTIDAD'])
+
+        # 2. Regresar pieza al inventario
+        ok, msg = guardar_entrada(ws_origen, item_data['CLAVE'], item_data['NOMBRE'], rack_retorno, cantidad, usuario)
         
         if ok:
-            # 2. Borramos de pendientes
-            hojas['Traslados_Pendientes'].delete_rows(fila_traslado)
+            # 3. Borrar de pendientes SOLO si se guardó bien
+            hojas['Traslados_Pendientes'].delete_rows(fila_real_borrar)
             
-            # 3. Log de movimiento
-            fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            hojas['Movimientos'].append_row([fecha, clave, "Cancelación Traslado", f"Regresado a {rack_retorno}", cantidad, 0, usuario, ws_origen.title])
+            # Log
+            fecha_log = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            hojas['Movimientos'].append_row([fecha_log, item_data['CLAVE'], "Cancelación Traslado", f"Regresado a {rack_retorno}", cantidad, 0, usuario, ws_origen.title])
             
-            return True, "✅ Traslado cancelado y material recuperado."
+            return True, "✅ Traslado cancelado correctamente y material recuperado."
         else:
-            return False, f"No se pudo restaurar el stock: {msg}"
-            
+            return False, f"Error al restaurar inventario: {msg}"
+
     except Exception as e:
-        return False, f"Error al cancelar: {e}"
+        return False, f"Error técnico al cancelar: {e}"
 
 def mover_interno_rack(ws, clave, nombre, rack_origen, rack_destino, cantidad, usuario):
     try:
@@ -169,15 +186,12 @@ def mover_interno_rack(ws, clave, nombre, rack_origen, rack_destino, cantidad, u
         rack_destino_clean = limpiar_texto(rack_destino)
         cantidad = int(cantidad)
 
-        if rack_origen_clean == rack_destino_clean:
-            return False, "❌ El rack de destino es igual al de origen."
+        if rack_origen_clean == rack_destino_clean: return False, "❌ El rack de destino es igual al de origen."
 
         fila_origen, cant_origen = obtener_fila_exacta(ws, clave_clean, rack_origen_clean)
-        if not fila_origen or cant_origen < cantidad:
-            return False, "❌ Stock insuficiente en origen."
+        if not fila_origen or cant_origen < cantidad: return False, "❌ Stock insuficiente en origen."
 
-        nueva_cant_origen = cant_origen - cantidad
-        ws.update_cell(fila_origen, 4, nueva_cant_origen)
+        ws.update_cell(fila_origen, 4, cant_origen - cantidad)
 
         fila_destino, cant_destino = obtener_fila_exacta(ws, clave_clean, rack_destino_clean)
         if fila_destino:
@@ -188,11 +202,9 @@ def mover_interno_rack(ws, clave, nombre, rack_origen, rack_destino, cantidad, u
         
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         hojas['Movimientos'].append_row([fecha, clave_clean, "Reubicación Interna", f"De {rack_origen_clean} a {rack_destino_clean}", cantidad, 0, usuario, ws.title])
-
         return True, f"✅ Reubicado: {cantidad} pz de {rack_origen_clean} a {rack_destino_clean}."
 
-    except Exception as e:
-        return False, f"Error moviendo: {e}"
+    except Exception as e: return False, f"Error moviendo: {e}"
 
 def procesar_baja_venta(ws_origen, clave, rack, detalle, cantidad, precio, usuario):
     try:
@@ -202,20 +214,15 @@ def procesar_baja_venta(ws_origen, clave, rack, detalle, cantidad, precio, usuar
         
         fila, cant_actual = obtener_fila_exacta(ws_origen, clave_clean, rack_clean)
         
-        if not fila:
-            return False, f"❌ No se encontró la clave {clave_clean} en {rack_clean}."
-        if cant_actual < cantidad:
-            return False, f"❌ Stock insuficiente en {rack_clean}. Tienes: {cant_actual}"
+        if not fila: return False, f"❌ No se encontró la clave {clave_clean} en {rack_clean}."
+        if cant_actual < cantidad: return False, f"❌ Stock insuficiente en {rack_clean}. Tienes: {cant_actual}"
         
-        nueva_cant = cant_actual - cantidad
-        ws_origen.update_cell(fila, 4, nueva_cant)
+        ws.update_cell(fila, 4, cant_actual - cantidad)
         
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         hojas['Movimientos'].append_row([fecha, clave_clean, "Venta/Instalación", f"{detalle} (Desde {rack_clean})", cantidad, precio, usuario, ws_origen.title])
-        
-        return True, f"✅ Venta registrada. Quedan {nueva_cant}."
-    except Exception as e:
-        return False, f"Error: {e}"
+        return True, f"✅ Venta registrada. Quedan {cant_actual - cantidad}."
+    except Exception as e: return False, f"Error: {e}"
 
 def finalizar_recepcion(suc_destino_nombre, clave, nombre, cantidad, rack, usuario, fila_traslado):
     try:
@@ -230,14 +237,11 @@ def finalizar_recepcion(suc_destino_nombre, clave, nombre, cantidad, rack, usuar
             fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             hojas['Movimientos'].append_row([fecha, clave, "Recepción Traslado", "Recibido en sucursal", cantidad, 0, usuario, suc_destino_nombre])
             return True, msg
-        else:
-            return False, f"Fallo al guardar: {msg}"
-    except Exception as e:
-        return False, f"Error crítico: {e}"
+        else: return False, f"Fallo al guardar: {msg}"
+    except Exception as e: return False, f"Error crítico: {e}"
 
 # --- LOGIN ---
-if 'logueado' not in st.session_state:
-    st.session_state.logueado = False
+if 'logueado' not in st.session_state: st.session_state.logueado = False
 
 if not st.session_state.logueado:
     col1, col2, col3 = st.columns([1,2,1])
@@ -251,8 +255,7 @@ if not st.session_state.logueado:
                 st.session_state.logueado = True
                 st.session_state.user_data = {"user": u, **credenciales[u]}
                 st.rerun()
-            else:
-                st.error("Datos incorrectos.")
+            else: st.error("Datos incorrectos.")
         st.markdown("---")
     st.stop()
 
@@ -269,25 +272,18 @@ with st.sidebar:
     nombre_visual_sucursal = NOMBRES_SUCURSALES.get(sucursal_asignada, sucursal_asignada)
     st.header(f"🏢 {nombre_visual_sucursal}")
     st.caption(f"Usuario: {usuario}")
-    
     if st.button("🚪 Cerrar Sesión"):
         st.session_state.logueado = False
         st.rerun()
-    
     st.markdown("---")
     opciones_menu = ["📦 Operaciones", "🚚 Traslados en Camino", "👀 Rack Visual"]
-    if rol == "admin":
-        opciones_menu.append("📜 Historial de Movimientos")
-        
+    if rol == "admin": opciones_menu.append("📜 Historial de Movimientos")
     menu = st.radio("Menú", opciones_menu)
 
 # Selección de hoja
 if rol == "admin":
     opciones_suc = ["Inventario_Suc1", "Inventario_Suc2", "Inventario_Suc3"]
-    sucursal_visualizada = st.selectbox(
-        "Vista Admin - Inventario:", opciones_suc, 
-        format_func=lambda x: NOMBRES_SUCURSALES.get(x, x)
-    )
+    sucursal_visualizada = st.selectbox("Vista Admin - Inventario:", opciones_suc, format_func=lambda x: NOMBRES_SUCURSALES.get(x, x))
     ws_activo = hojas[sucursal_visualizada]
 else:
     sucursal_visualizada = sucursal_asignada
@@ -296,14 +292,10 @@ else:
 # Pre-carga de inventario
 df_inventario = pd.DataFrame(ws_activo.get_all_records())
 if not df_inventario.empty:
-    if 'CLAVE' in df_inventario.columns:
-        df_inventario['CLAVE'] = df_inventario['CLAVE'].apply(limpiar_texto)
-    if 'RACK' in df_inventario.columns:
-        df_inventario['RACK'] = df_inventario['RACK'].apply(limpiar_texto)
-    if 'NOMBRE' in df_inventario.columns:
-        df_inventario['NOMBRE'] = df_inventario['NOMBRE'].astype(str)
-    if 'CANTIDAD' in df_inventario.columns:
-        df_inventario['CANTIDAD'] = pd.to_numeric(df_inventario['CANTIDAD'], errors='coerce').fillna(0)
+    if 'CLAVE' in df_inventario.columns: df_inventario['CLAVE'] = df_inventario['CLAVE'].apply(limpiar_texto)
+    if 'RACK' in df_inventario.columns: df_inventario['RACK'] = df_inventario['RACK'].apply(limpiar_texto)
+    if 'NOMBRE' in df_inventario.columns: df_inventario['NOMBRE'] = df_inventario['NOMBRE'].astype(str)
+    if 'CANTIDAD' in df_inventario.columns: df_inventario['CANTIDAD'] = pd.to_numeric(df_inventario['CANTIDAD'], errors='coerce').fillna(0)
 
 # ==========================================
 # PESTAÑA 1: OPERACIONES
@@ -314,10 +306,10 @@ if menu == "📦 Operaciones":
     with col_t2: 
         if st.button("🔄 ACTUALIZAR DATOS", type="primary"): st.rerun()
 
-    # --- HERRAMIENTA DE LIMPIEZA DE DUPLICADOS (SOLO ADMIN) ---
+    # --- HERRAMIENTA DE LIMPIEZA ---
     if usuario == "admin":
         with st.expander("🧹 HERRAMIENTA DE LIMPIEZA DE DUPLICADOS", expanded=False):
-            st.warning(f"⚠️ ¡Cuidado! Esto eliminará las filas duplicadas en '{NOMBRES_SUCURSALES.get(sucursal_visualizada)}'.")
+            st.warning(f"⚠️ Esto eliminará las filas duplicadas en '{NOMBRES_SUCURSALES.get(sucursal_visualizada)}'.")
             if st.button("🔴 EJECUTAR LIMPIEZA AHORA"):
                 try:
                     data = ws_activo.get_all_records()
@@ -331,7 +323,6 @@ if menu == "📦 Operaciones":
                         df_clean = df_clean.drop_duplicates(subset=['CLAVE_TEMP', 'RACK_TEMP'], keep='first')
                         df_clean = df_clean.drop(columns=['CLAVE_TEMP', 'RACK_TEMP'])
                         eliminados = rows_antes - len(df_clean)
-                        
                         if eliminados > 0:
                             ws_activo.clear()
                             ws_activo.update([df_clean.columns.values.tolist()] + df_clean.values.tolist())
@@ -475,7 +466,6 @@ elif menu == "🚚 Traslados en Camino":
         tab_recibir, tab_enviados = st.tabs(["📥 POR RECIBIR", "📤 ENVIADOS (CANCELAR)"])
         
         with tab_recibir:
-            # Lógica existente de recibir
             mis_llegadas = df_p[df_p['DESTINO'] == sucursal_visualizada].reset_index()
             if mis_llegadas.empty:
                 st.success("Nada pendiente por recibir.")
@@ -503,20 +493,19 @@ elif menu == "🚚 Traslados en Camino":
                             else: st.warning("Falta Rack.")
 
         with tab_enviados:
-            # NUEVA LÓGICA DE CANCELAR
             mis_envios = df_p[df_p['ORIGEN'] == sucursal_visualizada].reset_index()
             
             if mis_envios.empty:
-                st.info("No has enviado nada recientemente.")
+                st.info("No tienes envíos pendientes.")
             else:
-                st.write("Estos son los materiales que has enviado y aún no han sido recibidos.")
+                st.write("Estos envíos **aún no han sido aceptados** y pueden cancelarse.")
                 df_mostrar = mis_envios.copy()
                 df_mostrar['DESTINO'] = df_mostrar['DESTINO'].map(NOMBRES_SUCURSALES).fillna(df_mostrar['DESTINO'])
                 st.dataframe(df_mostrar[['FECHA','DESTINO','CLAVE','CANTIDAD']], use_container_width=True)
                 
                 st.divider()
                 st.subheader("🛑 Cancelar Traslado (Regresar a Inventario)")
-                st.warning("Si cancelas, la pieza volverá a tu inventario inmediatamente.")
+                st.warning("Solo puedes cancelar envíos que NO han sido aceptados todavía.")
                 
                 opciones_cancelar = mis_envios.apply(lambda x: f"{x['CLAVE']} ({x['CANTIDAD']}pz) -> {NOMBRES_SUCURSALES.get(x['DESTINO'],x['DESTINO'])}", axis=1).tolist()
                 seleccion_cancelar = st.selectbox("Selecciona envío a cancelar:", opciones_cancelar)
@@ -527,12 +516,12 @@ elif menu == "🚚 Traslados en Camino":
                     
                     with st.form("form_cancelar"):
                         st.write(f"Vas a recuperar: **{fila_c['CLAVE']}** ({fila_c['CANTIDAD']} pz)")
-                        # Preguntamos el rack porque el original no se guarda en el log de pendientes
                         rack_retorno = st.text_input("📍 ¿En qué Rack la guardarás de nuevo?", placeholder="Ej. PISO")
                         
                         if st.form_submit_button("🚨 CANCELAR ENVÍO"):
                             if rack_retorno:
-                                ok, m = cancelar_traslado(ws_activo, fila_c['CLAVE'], fila_c['NOMBRE'], fila_c['CANTIDAD'], rack_retorno, int(fila_c['index'])+2, usuario)
+                                # Usamos la nueva función segura
+                                ok, m = cancelar_traslado_seguro(ws_activo, fila_c, rack_retorno, usuario)
                                 if ok:
                                     st.success(m)
                                     time.sleep(2)
