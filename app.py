@@ -77,6 +77,7 @@ def obtener_fila_exacta(ws, clave, rack):
     if not filtro.empty:
         filtro = filtro.sort_values(by='CANTIDAD', ascending=False)
         indice_pandas = filtro.index[0]
+        # Convertimos a int nativo de Python para evitar error int64
         cantidad_actual = int(filtro.iloc[0]['CANTIDAD'])
         return indice_pandas + 2, cantidad_actual
             
@@ -92,7 +93,7 @@ def guardar_entrada(ws_destino, clave, nombre, rack, cantidad, usuario):
         fila, cant_actual = obtener_fila_exacta(ws_destino, clave_clean, rack_clean)
 
         if fila:
-            nueva_cant = cant_actual + cantidad
+            nueva_cant = int(cant_actual + cantidad)
             ws_destino.update_cell(fila, 4, nueva_cant)
             ws_destino.update_cell(fila, 5, fecha)
             return True, f"✅ Stock actualizado en {rack_clean}. ({cant_actual} -> {nueva_cant})"
@@ -116,7 +117,7 @@ def iniciar_traslado(ws_origen, clave, rack, cantidad, suc_destino, usuario):
             return False, f"❌ Stock insuficiente en {rack_clean}. Tienes: {cant_actual}"
 
         nombre_prod = ws_origen.cell(fila, 2).value 
-        nueva_cant = cant_actual - cantidad
+        nueva_cant = int(cant_actual - cantidad)
         ws_origen.update_cell(fila, 4, nueva_cant)
         
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -150,6 +151,7 @@ def cancelar_traslado_seguro(ws_origen, item_data, rack_retorno, usuario):
             return False, "❌ ERROR: Esta pieza ya no está en pendientes. Es probable que la otra sucursal la acabara de aceptar."
             
         fila_real_borrar = match.index[0] + 2
+        # Aseguramos conversión a int de Python
         cantidad = int(item_data['CANTIDAD'])
 
         ok, msg = guardar_entrada(ws_origen, item_data['CLAVE'], item_data['NOMBRE'], rack_retorno, cantidad, usuario)
@@ -177,11 +179,11 @@ def mover_interno_rack(ws, clave, nombre, rack_origen, rack_destino, cantidad, u
         fila_origen, cant_origen = obtener_fila_exacta(ws, clave_clean, rack_origen_clean)
         if not fila_origen or cant_origen < cantidad: return False, "❌ Stock insuficiente en origen."
 
-        ws.update_cell(fila_origen, 4, cant_origen - cantidad)
+        ws.update_cell(fila_origen, 4, int(cant_origen - cantidad))
 
         fila_destino, cant_destino = obtener_fila_exacta(ws, clave_clean, rack_destino_clean)
         if fila_destino:
-            ws.update_cell(fila_destino, 4, cant_destino + cantidad)
+            ws.update_cell(fila_destino, 4, int(cant_destino + cantidad))
         else:
             fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             ws.append_row([clave_clean, nombre, rack_destino_clean, cantidad, fecha])
@@ -203,12 +205,14 @@ def procesar_baja_venta(ws_origen, clave, rack, detalle, cantidad, precio, usuar
         if not fila: return False, f"❌ No se encontró la clave {clave_clean} en {rack_clean}."
         if cant_actual < cantidad: return False, f"❌ Stock insuficiente en {rack_clean}. Tienes: {cant_actual}"
         
-        # --- AQUÍ ESTABA EL ERROR, YA CORREGIDO (ws_origen) ---
-        ws_origen.update_cell(fila, 4, cant_actual - cantidad)
+        # --- AQUÍ ESTABA EL ERROR (CORREGIDO) ---
+        # Antes decía 'ws', ahora dice 'ws_origen'
+        nueva_cantidad = int(cant_actual - cantidad)
+        ws_origen.update_cell(fila, 4, nueva_cantidad)
         
         fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         hojas['Movimientos'].append_row([fecha, clave_clean, "Venta/Instalación", f"{detalle} (Desde {rack_clean})", cantidad, precio, usuario, ws_origen.title])
-        return True, f"✅ Venta registrada. Quedan {cant_actual - cantidad}."
+        return True, f"✅ Venta registrada. Quedan {nueva_cantidad}."
     except Exception as e: return False, f"Error: {e}"
 
 def finalizar_recepcion(suc_destino_nombre, clave, nombre, cantidad, rack, usuario, fila_traslado):
@@ -277,7 +281,13 @@ else:
     ws_activo = hojas[sucursal_asignada]
 
 # Pre-carga de inventario
-df_inventario = pd.DataFrame(ws_activo.get_all_records())
+try:
+    data_inv = ws_activo.get_all_records()
+    df_inventario = pd.DataFrame(data_inv)
+except Exception as e:
+    st.error("Error leyendo inventario (Posible límite de API). Espera unos segundos y recarga.")
+    df_inventario = pd.DataFrame()
+
 if not df_inventario.empty:
     if 'CLAVE' in df_inventario.columns: df_inventario['CLAVE'] = df_inventario['CLAVE'].apply(limpiar_texto)
     if 'RACK' in df_inventario.columns: df_inventario['RACK'] = df_inventario['RACK'].apply(limpiar_texto)
@@ -443,7 +453,8 @@ elif menu == "🚚 Traslados en Camino":
     if st.button("🔄 Actualizar"): st.rerun()
     
     try:
-        df_p = pd.DataFrame(hojas['Traslados_Pendientes'].get_all_records())
+        data_p = hojas['Traslados_Pendientes'].get_all_records()
+        df_p = pd.DataFrame(data_p)
     except:
         df_p = pd.DataFrame()
 
@@ -525,7 +536,9 @@ elif menu == "👀 Rack Visual":
     st.title(f"Visor - {NOMBRES_SUCURSALES.get(sucursal_visualizada, sucursal_visualizada)}")
     if st.button("🔄 Refrescar"): st.rerun()
     
-    if not df_inventario.empty:
+    if not df_inventario.empty and 'RACK' in df_inventario.columns:
+        # Normalizamos racks para evitar errores si la columna no existe
+        df_inventario['RACK'] = df_inventario['RACK'].astype(str)
         racks = sorted(df_inventario['RACK'].unique().tolist())
         col_r1, col_r2 = st.columns([1, 3])
         with col_r1:
@@ -537,7 +550,7 @@ elif menu == "👀 Rack Visual":
                 resumen = filtro_rack.groupby(['CLAVE', 'NOMBRE'])['CANTIDAD'].sum().reset_index()
                 st.dataframe(resumen, use_container_width=True)
                 st.metric("Piezas Totales", int(resumen['CANTIDAD'].sum()))
-    else: st.warning("Sin datos.")
+    else: st.warning("Sin datos para mostrar.")
 
 # ==========================================
 # PESTAÑA 4: HISTORIAL
@@ -546,7 +559,8 @@ elif menu == "📜 Historial de Movimientos" and rol == "admin":
     st.title("Historial")
     if st.button("🔄 Actualizar"): st.rerun()
     try:
-        df_movs = pd.DataFrame(hojas['Movimientos'].get_all_records())
+        data_movs = hojas['Movimientos'].get_all_records()
+        df_movs = pd.DataFrame(data_movs)
         if not df_movs.empty:
             st.dataframe(df_movs.sort_index(ascending=False), use_container_width=True)
             st.download_button("Descargar CSV", df_movs.to_csv(index=False).encode('utf-8'), "historial.csv")
