@@ -77,9 +77,9 @@ def obtener_fila_exacta(ws, clave, rack):
     if not filtro.empty:
         filtro = filtro.sort_values(by='CANTIDAD', ascending=False)
         indice_pandas = filtro.index[0]
-        # Convertimos a int nativo de Python para evitar error int64
         cantidad_actual = int(filtro.iloc[0]['CANTIDAD'])
-        return indice_pandas + 2, cantidad_actual
+        # CORRECCIÓN IMPORTANTE: Convertir índice a int nativo
+        return int(indice_pandas + 2), cantidad_actual
             
     return None, 0
 
@@ -93,6 +93,7 @@ def guardar_entrada(ws_destino, clave, nombre, rack, cantidad, usuario):
         fila, cant_actual = obtener_fila_exacta(ws_destino, clave_clean, rack_clean)
 
         if fila:
+            # fila ya viene convertido a int desde obtener_fila_exacta
             nueva_cant = int(cant_actual + cantidad)
             ws_destino.update_cell(fila, 4, nueva_cant)
             ws_destino.update_cell(fila, 5, fecha)
@@ -149,15 +150,19 @@ def cancelar_traslado_seguro(ws_origen, item_data, rack_retorno, usuario):
         
         if match.empty:
             return False, "❌ ERROR: Esta pieza ya no está en pendientes. Es probable que la otra sucursal la acabara de aceptar."
-            
-        fila_real_borrar = match.index[0] + 2
-        # Aseguramos conversión a int de Python
+        
+        # CORRECCIÓN CRÍTICA: Convertir el índice de Pandas (int64) a int de Python
+        fila_real_borrar = int(match.index[0] + 2)
+        
         cantidad = int(item_data['CANTIDAD'])
 
+        # Restauramos la pieza
         ok, msg = guardar_entrada(ws_origen, item_data['CLAVE'], item_data['NOMBRE'], rack_retorno, cantidad, usuario)
         
         if ok:
+            # Usamos el entero convertido
             hojas['Traslados_Pendientes'].delete_rows(fila_real_borrar)
+            
             fecha_log = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             hojas['Movimientos'].append_row([fecha_log, item_data['CLAVE'], "Cancelación Traslado", f"Regresado a {rack_retorno}", cantidad, 0, usuario, ws_origen.title])
             return True, "✅ Traslado cancelado correctamente y material recuperado."
@@ -165,7 +170,7 @@ def cancelar_traslado_seguro(ws_origen, item_data, rack_retorno, usuario):
             return False, f"Error al restaurar inventario: {msg}"
 
     except Exception as e:
-        return False, f"Error técnico al cancelar: {e}"
+        return False, f"Error técnico al cancelar ({type(e).__name__}): {e}"
 
 def mover_interno_rack(ws, clave, nombre, rack_origen, rack_destino, cantidad, usuario):
     try:
@@ -177,6 +182,7 @@ def mover_interno_rack(ws, clave, nombre, rack_origen, rack_destino, cantidad, u
         if rack_origen_clean == rack_destino_clean: return False, "❌ El rack de destino es igual al de origen."
 
         fila_origen, cant_origen = obtener_fila_exacta(ws, clave_clean, rack_origen_clean)
+        # fila_origen ya es int gracias a obtener_fila_exacta
         if not fila_origen or cant_origen < cantidad: return False, "❌ Stock insuficiente en origen."
 
         ws.update_cell(fila_origen, 4, int(cant_origen - cantidad))
@@ -205,8 +211,6 @@ def procesar_baja_venta(ws_origen, clave, rack, detalle, cantidad, precio, usuar
         if not fila: return False, f"❌ No se encontró la clave {clave_clean} en {rack_clean}."
         if cant_actual < cantidad: return False, f"❌ Stock insuficiente en {rack_clean}. Tienes: {cant_actual}"
         
-        # --- AQUÍ ESTABA EL ERROR (CORREGIDO) ---
-        # Antes decía 'ws', ahora dice 'ws_origen'
         nueva_cantidad = int(cant_actual - cantidad)
         ws_origen.update_cell(fila, 4, nueva_cantidad)
         
@@ -218,7 +222,7 @@ def procesar_baja_venta(ws_origen, clave, rack, detalle, cantidad, precio, usuar
 def finalizar_recepcion(suc_destino_nombre, clave, nombre, cantidad, rack, usuario, fila_traslado):
     try:
         cantidad = int(cantidad)
-        fila_traslado = int(fila_traslado)
+        fila_traslado = int(fila_traslado) # Aseguramos int nativo
         ws_local = hojas[suc_destino_nombre]
         
         ok, msg = guardar_entrada(ws_local, clave, nombre, rack, cantidad, usuario)
