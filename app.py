@@ -13,6 +13,7 @@ NOMBRES_SUCURSALES = {
     "Inventario_Suc1": "Arriaga",
     "Inventario_Suc2": "Libramiento",
     "Inventario_Suc3": "Zamora",
+    "Inventario_Suc4": "Moroleon",  # <--- NUEVA SUCURSAL
     "todas": "Todas las Sucursales"
 }
 
@@ -31,11 +32,13 @@ try:
         "Inventario_Suc1": sh.worksheet('Inventario_Suc1'),
         "Inventario_Suc2": sh.worksheet('Inventario_Suc2'),
         "Inventario_Suc3": sh.worksheet('Inventario_Suc3'),
+        "Inventario_Suc4": sh.worksheet('Inventario_Suc4'), # <--- CONEXIÓN NUEVA HOJA
         "Movimientos": sh.worksheet('Movimientos'),
         "Traslados_Pendientes": sh.worksheet('Traslados_Pendientes')
     }
 except Exception as e:
     st.error(f"⚠️ Error de conexión: {e}")
+    st.info("NOTA: Asegúrate de haber creado la pestaña 'Inventario_Suc4' en tu Google Sheet.")
     st.stop()
 
 # --- USUARIOS ---
@@ -43,7 +46,8 @@ credenciales = {
     "admin":       {"pass": "Xk9#mZ21!",     "rol": "admin", "sucursal": "todas"},
     "sucursal1":   {"pass": "Suc1_Ax7$",     "rol": "user",  "sucursal": "Inventario_Suc1"},
     "sucursal2":   {"pass": "Br4nch_Two!",   "rol": "user",  "sucursal": "Inventario_Suc2"},
-    "sucursal3":   {"pass": "T3rcera_P0s#",  "rol": "user",  "sucursal": "Inventario_Suc3"}
+    "sucursal3":   {"pass": "T3rcera_P0s#",  "rol": "user",  "sucursal": "Inventario_Suc3"},
+    "sucursal4":   {"pass": "Moro_L3on$",    "rol": "user",  "sucursal": "Inventario_Suc4"} # <--- NUEVO USUARIO
 }
 
 # --- FUNCIONES DE LÓGICA ---
@@ -78,7 +82,6 @@ def obtener_fila_exacta(ws, clave, rack):
         filtro = filtro.sort_values(by='CANTIDAD', ascending=False)
         indice_pandas = filtro.index[0]
         cantidad_actual = int(filtro.iloc[0]['CANTIDAD'])
-        # CORRECCIÓN IMPORTANTE: Convertir índice a int nativo
         return int(indice_pandas + 2), cantidad_actual
             
     return None, 0
@@ -93,7 +96,6 @@ def guardar_entrada(ws_destino, clave, nombre, rack, cantidad, usuario):
         fila, cant_actual = obtener_fila_exacta(ws_destino, clave_clean, rack_clean)
 
         if fila:
-            # fila ya viene convertido a int desde obtener_fila_exacta
             nueva_cant = int(cant_actual + cantidad)
             ws_destino.update_cell(fila, 4, nueva_cant)
             ws_destino.update_cell(fila, 5, fecha)
@@ -151,18 +153,13 @@ def cancelar_traslado_seguro(ws_origen, item_data, rack_retorno, usuario):
         if match.empty:
             return False, "❌ ERROR: Esta pieza ya no está en pendientes. Es probable que la otra sucursal la acabara de aceptar."
         
-        # CORRECCIÓN CRÍTICA: Convertir el índice de Pandas (int64) a int de Python
         fila_real_borrar = int(match.index[0] + 2)
-        
         cantidad = int(item_data['CANTIDAD'])
 
-        # Restauramos la pieza
         ok, msg = guardar_entrada(ws_origen, item_data['CLAVE'], item_data['NOMBRE'], rack_retorno, cantidad, usuario)
         
         if ok:
-            # Usamos el entero convertido
             hojas['Traslados_Pendientes'].delete_rows(fila_real_borrar)
-            
             fecha_log = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             hojas['Movimientos'].append_row([fecha_log, item_data['CLAVE'], "Cancelación Traslado", f"Regresado a {rack_retorno}", cantidad, 0, usuario, ws_origen.title])
             return True, "✅ Traslado cancelado correctamente y material recuperado."
@@ -182,7 +179,7 @@ def mover_interno_rack(ws, clave, nombre, rack_origen, rack_destino, cantidad, u
         if rack_origen_clean == rack_destino_clean: return False, "❌ El rack de destino es igual al de origen."
 
         fila_origen, cant_origen = obtener_fila_exacta(ws, clave_clean, rack_origen_clean)
-        # fila_origen ya es int gracias a obtener_fila_exacta
+        
         if not fila_origen or cant_origen < cantidad: return False, "❌ Stock insuficiente en origen."
 
         ws.update_cell(fila_origen, 4, int(cant_origen - cantidad))
@@ -222,7 +219,7 @@ def procesar_baja_venta(ws_origen, clave, rack, detalle, cantidad, precio, usuar
 def finalizar_recepcion(suc_destino_nombre, clave, nombre, cantidad, rack, usuario, fila_traslado):
     try:
         cantidad = int(cantidad)
-        fila_traslado = int(fila_traslado) # Aseguramos int nativo
+        fila_traslado = int(fila_traslado) 
         ws_local = hojas[suc_destino_nombre]
         
         ok, msg = guardar_entrada(ws_local, clave, nombre, rack, cantidad, usuario)
@@ -277,7 +274,8 @@ with st.sidebar:
 
 # Selección de hoja
 if rol == "admin":
-    opciones_suc = ["Inventario_Suc1", "Inventario_Suc2", "Inventario_Suc3"]
+    # ACTUALIZADO: Lista de sucursales para el Admin
+    opciones_suc = ["Inventario_Suc1", "Inventario_Suc2", "Inventario_Suc3", "Inventario_Suc4"]
     sucursal_visualizada = st.selectbox("Vista Admin - Inventario:", opciones_suc, format_func=lambda x: NOMBRES_SUCURSALES.get(x, x))
     ws_activo = hojas[sucursal_visualizada]
 else:
@@ -395,7 +393,8 @@ if menu == "📦 Operaciones":
                 else: 
                     st.divider()
                     st.info(f"El producto saldrá del rack: {rack_real}")
-                    todas = ["Inventario_Suc1", "Inventario_Suc2", "Inventario_Suc3"]
+                    # ACTUALIZADO: Lista de sucursales para traslados
+                    todas = ["Inventario_Suc1", "Inventario_Suc2", "Inventario_Suc3", "Inventario_Suc4"]
                     otras = [s for s in todas if s != sucursal_visualizada]
                     destino = st.selectbox("Enviar a:", otras, format_func=lambda x: NOMBRES_SUCURSALES.get(x, x))
                     
@@ -539,33 +538,3 @@ elif menu == "🚚 Traslados en Camino":
 elif menu == "👀 Rack Visual":
     st.title(f"Visor - {NOMBRES_SUCURSALES.get(sucursal_visualizada, sucursal_visualizada)}")
     if st.button("🔄 Refrescar"): st.rerun()
-    
-    if not df_inventario.empty and 'RACK' in df_inventario.columns:
-        # Normalizamos racks para evitar errores si la columna no existe
-        df_inventario['RACK'] = df_inventario['RACK'].astype(str)
-        racks = sorted(df_inventario['RACK'].unique().tolist())
-        col_r1, col_r2 = st.columns([1, 3])
-        with col_r1:
-            sel = st.radio("Rack:", racks) if racks else None
-        with col_r2:
-            if sel:
-                st.subheader(f"Contenido Rack: {sel}")
-                filtro_rack = df_inventario[df_inventario['RACK'] == sel]
-                resumen = filtro_rack.groupby(['CLAVE', 'NOMBRE'])['CANTIDAD'].sum().reset_index()
-                st.dataframe(resumen, use_container_width=True)
-                st.metric("Piezas Totales", int(resumen['CANTIDAD'].sum()))
-    else: st.warning("Sin datos para mostrar.")
-
-# ==========================================
-# PESTAÑA 4: HISTORIAL
-# ==========================================
-elif menu == "📜 Historial de Movimientos" and rol == "admin":
-    st.title("Historial")
-    if st.button("🔄 Actualizar"): st.rerun()
-    try:
-        data_movs = hojas['Movimientos'].get_all_records()
-        df_movs = pd.DataFrame(data_movs)
-        if not df_movs.empty:
-            st.dataframe(df_movs.sort_index(ascending=False), use_container_width=True)
-            st.download_button("Descargar CSV", df_movs.to_csv(index=False).encode('utf-8'), "historial.csv")
-    except: st.error("Error cargando historial.")
