@@ -13,12 +13,13 @@ NOMBRES_SUCURSALES = {
     "Inventario_Suc1": "Arriaga",
     "Inventario_Suc2": "Libramiento",
     "Inventario_Suc3": "Zamora",
-    "Inventario_Suc4": "Moroleon",  # <--- NUEVA SUCURSAL
+    "Inventario_Suc4": "Moroleon",
     "todas": "Todas las Sucursales"
 }
 
-# --- CONEXIÓN A GOOGLE SHEETS ---
-try:
+# --- CONEXIÓN A GOOGLE SHEETS (CON CACHÉ PARA MAYOR VELOCIDAD) ---
+@st.cache_resource
+def inicializar_conexion():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
@@ -26,13 +27,15 @@ try:
     credentials_dict = st.secrets["gcp_service_account"]
     creds = Credentials.from_service_account_info(credentials_dict, scopes=scopes)
     gc = gspread.authorize(creds)
-    sh = gc.open('Inventario_Cristales') 
-    
+    return gc.open('Inventario_Cristales') 
+
+try:
+    sh = inicializar_conexion()
     hojas = {
         "Inventario_Suc1": sh.worksheet('Inventario_Suc1'),
         "Inventario_Suc2": sh.worksheet('Inventario_Suc2'),
         "Inventario_Suc3": sh.worksheet('Inventario_Suc3'),
-        "Inventario_Suc4": sh.worksheet('Inventario_Suc4'), # <--- CONEXIÓN NUEVA HOJA
+        "Inventario_Suc4": sh.worksheet('Inventario_Suc4'),
         "Movimientos": sh.worksheet('Movimientos'),
         "Traslados_Pendientes": sh.worksheet('Traslados_Pendientes')
     }
@@ -41,13 +44,24 @@ except Exception as e:
     st.info("NOTA: Asegúrate de haber creado la pestaña 'Inventario_Suc4' en tu Google Sheet.")
     st.stop()
 
+# --- NUEVO: SISTEMA DE CACHÉ PARA EVITAR ERROR 429 ---
+@st.cache_data(ttl=60)
+def cargar_datos(nombre_hoja):
+    """Descarga los datos una vez y los guarda en memoria por 60 segundos para no saturar a Google"""
+    try:
+        ws = hojas[nombre_hoja]
+        data = ws.get_all_records()
+        return pd.DataFrame(data)
+    except:
+        return pd.DataFrame()
+
 # --- USUARIOS ---
 credenciales = {
     "admin":       {"pass": "Xk9#mZ21!",     "rol": "admin", "sucursal": "todas"},
     "sucursal1":   {"pass": "Suc1_Ax7$",     "rol": "user",  "sucursal": "Inventario_Suc1"},
     "sucursal2":   {"pass": "Br4nch_Two!",   "rol": "user",  "sucursal": "Inventario_Suc2"},
     "sucursal3":   {"pass": "T3rcera_P0s#",  "rol": "user",  "sucursal": "Inventario_Suc3"},
-    "sucursal4":   {"pass": "Moro_L3on$",    "rol": "user",  "sucursal": "Inventario_Suc4"} # <--- NUEVO USUARIO
+    "sucursal4":   {"pass": "Moro_L3on$",    "rol": "user",  "sucursal": "Inventario_Suc4"}
 }
 
 # --- FUNCIONES DE LÓGICA ---
@@ -274,7 +288,6 @@ with st.sidebar:
 
 # Selección de hoja
 if rol == "admin":
-    # ACTUALIZADO: Lista de sucursales para el Admin
     opciones_suc = ["Inventario_Suc1", "Inventario_Suc2", "Inventario_Suc3", "Inventario_Suc4"]
     sucursal_visualizada = st.selectbox("Vista Admin - Inventario:", opciones_suc, format_func=lambda x: NOMBRES_SUCURSALES.get(x, x))
     ws_activo = hojas[sucursal_visualizada]
@@ -282,13 +295,8 @@ else:
     sucursal_visualizada = sucursal_asignada
     ws_activo = hojas[sucursal_asignada]
 
-# Pre-carga de inventario
-try:
-    data_inv = ws_activo.get_all_records()
-    df_inventario = pd.DataFrame(data_inv)
-except Exception as e:
-    st.error("Error leyendo inventario (Posible límite de API). Espera unos segundos y recarga.")
-    df_inventario = pd.DataFrame()
+# --- AQUÍ USAMOS LA CACHÉ EN LUGAR DE PEDIRLE A GOOGLE DIRECTAMENTE ---
+df_inventario = cargar_datos(sucursal_visualizada)
 
 if not df_inventario.empty:
     if 'CLAVE' in df_inventario.columns: df_inventario['CLAVE'] = df_inventario['CLAVE'].apply(limpiar_texto)
@@ -303,7 +311,9 @@ if menu == "📦 Operaciones":
     col_t1, col_t2 = st.columns([3,1])
     with col_t1: st.title("Operaciones de Inventario")
     with col_t2: 
-        if st.button("🔄 ACTUALIZAR DATOS", type="primary"): st.rerun()
+        if st.button("🔄 ACTUALIZAR DATOS", type="primary"): 
+            st.cache_data.clear() # Limpia caché si lo aprietas
+            st.rerun()
 
     # --- HERRAMIENTA DE LIMPIEZA ---
     if usuario == "admin":
@@ -327,6 +337,7 @@ if menu == "📦 Operaciones":
                             ws_activo.update([df_clean.columns.values.tolist()] + df_clean.values.tolist())
                             st.success(f"✅ Se eliminaron {eliminados} duplicados.")
                             time.sleep(2)
+                            st.cache_data.clear() # Limpia caché
                             st.rerun()
                         else: st.info("Hoja limpia.")
                 except Exception as e: st.error(f"Error: {e}")
@@ -346,6 +357,7 @@ if menu == "📦 Operaciones":
                     if ok: 
                         st.success(txt)
                         time.sleep(1)
+                        st.cache_data.clear() # Limpia caché para reflejar datos
                         st.rerun()
                     else: st.error(txt)
                 else: st.warning("Falta clave.")
@@ -393,7 +405,6 @@ if menu == "📦 Operaciones":
                 else: 
                     st.divider()
                     st.info(f"El producto saldrá del rack: {rack_real}")
-                    # ACTUALIZADO: Lista de sucursales para traslados
                     todas = ["Inventario_Suc1", "Inventario_Suc2", "Inventario_Suc3", "Inventario_Suc4"]
                     otras = [s for s in todas if s != sucursal_visualizada]
                     destino = st.selectbox("Enviar a:", otras, format_func=lambda x: NOMBRES_SUCURSALES.get(x, x))
@@ -403,7 +414,8 @@ if menu == "📦 Operaciones":
 
                 if ok: 
                     st.success(msg)
-                    time.sleep(2)
+                    time.sleep(1)
+                    st.cache_data.clear() # Limpia caché
                     st.rerun()
                 elif msg: st.error(msg)
 
@@ -437,6 +449,7 @@ if menu == "📦 Operaciones":
                                             if ok:
                                                 st.success(txt)
                                                 time.sleep(1)
+                                                st.cache_data.clear() # Limpia caché
                                                 st.rerun()
                                             else: st.error(txt)
                                         else: st.warning("Rack inválido")
@@ -453,13 +466,12 @@ if menu == "📦 Operaciones":
 # ==========================================
 elif menu == "🚚 Traslados en Camino":
     st.title("Gestión de Traslados")
-    if st.button("🔄 Actualizar"): st.rerun()
+    if st.button("🔄 Actualizar"): 
+        st.cache_data.clear()
+        st.rerun()
     
-    try:
-        data_p = hojas['Traslados_Pendientes'].get_all_records()
-        df_p = pd.DataFrame(data_p)
-    except:
-        df_p = pd.DataFrame()
+    # --- USA CACHÉ PARA TRASLADOS ---
+    df_p = cargar_datos('Traslados_Pendientes')
 
     if df_p.empty or 'DESTINO' not in df_p.columns:
         st.info("No hay traslados.")
@@ -488,7 +500,8 @@ elif menu == "🚚 Traslados en Camino":
                                 ok, m = finalizar_recepcion(sucursal_visualizada, fila['CLAVE'], fila['NOMBRE'], fila['CANTIDAD'], rack_in, usuario, int(fila['index'])+2)
                                 if ok: 
                                     st.success(m)
-                                    time.sleep(2)
+                                    time.sleep(1)
+                                    st.cache_data.clear() # Limpia caché
                                     st.rerun()
                                 else: st.error(m)
                             else: st.warning("Falta Rack.")
@@ -521,11 +534,11 @@ elif menu == "🚚 Traslados en Camino":
                         
                         if st.form_submit_button("🚨 CANCELAR ENVÍO"):
                             if rack_retorno:
-                                # Usamos la nueva función segura
                                 ok, m = cancelar_traslado_seguro(ws_activo, fila_c, rack_retorno, usuario)
                                 if ok:
                                     st.success(m)
-                                    time.sleep(2)
+                                    time.sleep(1)
+                                    st.cache_data.clear() # Limpia caché
                                     st.rerun()
                                 else:
                                     st.error(m)
@@ -537,4 +550,39 @@ elif menu == "🚚 Traslados en Camino":
 # ==========================================
 elif menu == "👀 Rack Visual":
     st.title(f"Visor - {NOMBRES_SUCURSALES.get(sucursal_visualizada, sucursal_visualizada)}")
-    if st.button("🔄 Refrescar"): st.rerun()
+    if st.button("🔄 Refrescar"): 
+        st.cache_data.clear()
+        st.rerun()
+    
+    if not df_inventario.empty and 'RACK' in df_inventario.columns:
+        df_inventario['RACK'] = df_inventario['RACK'].astype(str)
+        racks = sorted(df_inventario['RACK'].unique().tolist())
+        col_r1, col_r2 = st.columns([1, 3])
+        with col_r1:
+            sel = st.radio("Rack:", racks) if racks else None
+        with col_r2:
+            if sel:
+                st.subheader(f"Contenido Rack: {sel}")
+                filtro_rack = df_inventario[df_inventario['RACK'] == sel]
+                resumen = filtro_rack.groupby(['CLAVE', 'NOMBRE'])['CANTIDAD'].sum().reset_index()
+                st.dataframe(resumen, use_container_width=True)
+                st.metric("Piezas Totales", int(resumen['CANTIDAD'].sum()))
+    else: st.warning("Sin datos para mostrar.")
+
+# ==========================================
+# PESTAÑA 4: HISTORIAL
+# ==========================================
+elif menu == "📜 Historial de Movimientos" and rol == "admin":
+    st.title("Historial")
+    if st.button("🔄 Actualizar"): 
+        st.cache_data.clear()
+        st.rerun()
+        
+    # --- USA CACHÉ PARA HISTORIAL ---
+    df_movs = cargar_datos('Movimientos')
+    
+    if not df_movs.empty:
+        st.dataframe(df_movs.sort_index(ascending=False), use_container_width=True)
+        st.download_button("Descargar CSV", df_movs.to_csv(index=False).encode('utf-8'), "historial.csv")
+    else:
+        st.info("No hay historial disponible.")
