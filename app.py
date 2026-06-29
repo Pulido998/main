@@ -379,6 +379,54 @@ def op_clean_duplicates(sheet):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# MEJORA 1b: LIMPIEZA DE DUPLICADOS CON 0 PIEZAS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def limpiar_duplicados_cero(ws_inventario):
+    """
+    Busca filas duplicadas (misma CLAVE + RACK + SUCURSAL) cuya CANTIDAD
+    sea 0 y las elimina de Google Sheets borrando de abajo hacia arriba
+    para no desplazar índices durante la eliminación.
+    Retorna (bool, str) con el resultado de la operación.
+    """
+    try:
+        records = ws_inventario.get_all_records()
+        if not records:
+            return True, "La hoja está vacía. No hay nada que limpiar."
+
+        df = pd.DataFrame(records)
+        df["_row"] = range(2, len(df) + 2)  # índice de fila real en Google Sheets (1-based + encabezado)
+        df["CLAVE"] = df["CLAVE"].apply(_clean)
+        df["RACK"] = df["RACK"].apply(_normalize_rack)
+        df["CANTIDAD"] = pd.to_numeric(df["CANTIDAD"], errors="coerce").fillna(0).astype(int)
+
+        # Identificar grupos duplicados (misma CLAVE + RACK)
+        # Dentro de cada grupo, marcar como "candidata a borrar" la fila con CANTIDAD == 0
+        # si en ese grupo existe al menos una fila con CANTIDAD > 0
+        filas_a_borrar = []
+        grupos = df.groupby(["CLAVE", "RACK"])
+        for _, grupo in grupos:
+            if len(grupo) > 1:
+                # Hay duplicados en este par CLAVE-RACK
+                con_stock = grupo[grupo["CANTIDAD"] > 0]
+                sin_stock = grupo[grupo["CANTIDAD"] == 0]
+                if not con_stock.empty and not sin_stock.empty:
+                    # Sólo eliminamos las de 0 si hay al menos una con stock
+                    filas_a_borrar.extend(sin_stock["_row"].tolist())
+
+        if not filas_a_borrar:
+            return True, "No se encontraron duplicados con 0 piezas eliminables."
+
+        # Borrar de abajo hacia arriba para no correr los índices
+        for row_idx in sorted(filas_a_borrar, reverse=True):
+            ws_inventario.delete_rows(row_idx)
+
+        return True, f"{len(filas_a_borrar)} fila(s) duplicada(s) con 0 piezas eliminada(s) correctamente."
+    except Exception as e:
+        return False, f"Error en limpiar_duplicados_cero: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # HELPERS DE UI
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -436,6 +484,7 @@ SECTION_LABELS: dict[str, str] = {
     "operaciones": "🔄 Centro de Operaciones",
     "logistica": "🚚 Tránsitos",
     "pedidos": "📋 Pedidos",
+    "express": "⚡ Operación Express",    # MEJORA 2: nueva sección
     "auditoria": "📜 Auditoría",
 }
 
@@ -500,9 +549,21 @@ def ui_dashboard(sheet: str, rol: str):
     if rol == "admin":
         with st.expander("🧹 Mantenimiento — Consolidar Duplicados y Normalizar Racks"):
             st.warning(f"Consolida filas duplicadas en {nombre_suc}. No se pierde stock.")
-            if st.button("▶ Ejecutar Limpieza", type="primary"):
-                ok, msg = op_clean_duplicates(sheet)
-                _ok(msg) if ok else _err(msg)
+            col_clean1, col_clean2 = st.columns(2)
+            with col_clean1:
+                if st.button("▶ Ejecutar Limpieza", type="primary"):
+                    ok, msg = op_clean_duplicates(sheet)
+                    _ok(msg) if ok else _err(msg)
+            with col_clean2:
+                if st.button("🗑️ Eliminar Duplicados con 0 Piezas", type="primary"):
+                    # MEJORA 1b: limpiar filas con 0 piezas que son duplicados de otra con stock
+                    ws_inv = _sheet(sheet)
+                    ok, msg = limpiar_duplicados_cero(ws_inv)
+                    if ok:
+                        _ok(msg)
+                        _refresh(sheet)
+                    else:
+                        _err(msg)
 
     if df_all.empty:
         st.info("No hay productos registrados en esta sucursal.")
@@ -586,6 +647,8 @@ def ui_operations(sheet: str, usuario: str):
             st.markdown(f'<div class="prod-info"><span class="prod-clave">{clave_sel}</span><span class="prod-nombre">{nombre_disp or "Sin descripción"}</span></div>', unsafe_allow_html=True)
 
             stock_rows = df_stock[df_stock["CLAVE"] == clave_sel].copy()
+            # ── MEJORA 1a: ordenar de mayor a menor stock para priorizar filas con existencia ──
+            stock_rows = stock_rows.sort_values(by="CANTIDAD", ascending=False)
             rack_opts = stock_rows.apply(lambda r: f"{r['RACK']} ({r['CANTIDAD']} pz disponible)", axis=1).tolist()
 
             c_rk, c_ac = st.columns([1.2, 1.4])
@@ -820,6 +883,120 @@ def ui_pedidos(sheet: str):
         st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════
+# MEJORA 2: MÓDULO DE OPERACIÓN EXPRESS (COMPRA + INSTALACIÓN INMEDIATA)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ui_operacion_express(sheet: str, usuario: str):
+    """
+    Módulo de Operación Express: registra simultáneamente una ENTRADA y una
+    SALIDA en la pestaña 'Historial' (Movimientos) sin tocar el Inventario.
+    Se usa cuando se compra a un proveedor externo y se instala al cliente
+    de inmediato, de modo que la pieza nunca toca el stock físico.
+    """
+    nombre_suc = SUCURSALES.get(sheet, sheet)
+    _page_header(
+        "⚡",
+        "Operación Express",
+        f"Compra inmediata a proveedor + instalación al cliente — {nombre_suc} · Sin alterar inventario físico",
+    )
+
+    st.info(
+        "⚡ **¿Qué hace este módulo?** Registra DOS movimientos en la bitácora: "
+        "una **ENTRADA** (compra al proveedor externo) y una **SALIDA** (instalación a la aseguradora/cliente). "
+        "El stock de Inventario **no se modifica**.",
+        icon="ℹ️",
+    )
+
+    _section("Datos de la Operación Express")
+
+    with st.form("form_express", clear_on_submit=True):
+        c1, c2, c3 = st.columns([1.5, 1, 1])
+        clave_exp   = c1.text_input("Clave del Cristal *").upper().strip()
+        cantidad_exp = c2.number_input("Cantidad *", min_value=1, max_value=999, value=1)
+        sucursal_exp = c3.selectbox(
+            "Sucursal *",
+            list(SUCURSALES.keys()),
+            index=list(SUCURSALES.keys()).index(sheet),
+            format_func=lambda x: SUCURSALES[x],
+        )
+
+        c4, c5 = st.columns(2)
+        proveedor_exp  = c4.text_input("Proveedor Externo *", placeholder="Ej: Cristales del Norte SA")
+        aseguradora_exp = c5.text_input("Aseguradora / Cliente *", placeholder="Ej: GNP, AXA, Público General")
+
+        notas_exp = st.text_input("Notas u observaciones (opcional)", placeholder="Ej: Vehículo siniestrado, urgente")
+
+        st.markdown("---")
+        submitted = st.form_submit_button("⚡ Registrar Operación Express", type="primary", use_container_width=True)
+
+    if submitted:
+        # Validaciones básicas
+        if not clave_exp:
+            _err("La clave del cristal es obligatoria.")
+            return
+        if not proveedor_exp.strip():
+            _err("El nombre del Proveedor Externo es obligatorio.")
+            return
+        if not aseguradora_exp.strip():
+            _err("La Aseguradora / Cliente es obligatoria.")
+            return
+
+        rack_virtual = "EXPRESS"
+        fecha_op = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        suc_nombre = SUCURSALES.get(sucursal_exp, sucursal_exp)
+
+        detalle_entrada = f"Compra Express — Proveedor: {proveedor_exp.strip()}"
+        if notas_exp.strip():
+            detalle_entrada += f" — Nota: {notas_exp.strip()}"
+
+        detalle_salida = f"Instalación Express — Aseguradora/Cliente: {aseguradora_exp.strip()}"
+        if notas_exp.strip():
+            detalle_salida += f" — Nota: {notas_exp.strip()}"
+
+        try:
+            ws_historial = _sheet("Movimientos")
+
+            # Fila 1 — ENTRADA (Compra al proveedor externo)
+            ws_historial.append_row([
+                fecha_op,
+                _clean(clave_exp),
+                "ENTRADA Express",
+                detalle_entrada,
+                cantidad_exp,
+                0,           # Precio (se puede agregar en notas si es necesario)
+                usuario,
+                suc_nombre,
+            ])
+
+            # Fila 2 — SALIDA (Instalación a aseguradora/cliente)
+            ws_historial.append_row([
+                fecha_op,
+                _clean(clave_exp),
+                "SALIDA Express",
+                detalle_salida,
+                cantidad_exp,
+                0,
+                usuario,
+                suc_nombre,
+            ])
+
+            _refresh("Movimientos")
+
+            _ok(
+                f"✅ Operación Express registrada: "
+                f"**{cantidad_exp} pz** de **{_clean(clave_exp)}** — "
+                f"Proveedor: {proveedor_exp.strip()} → "
+                f"Cliente: {aseguradora_exp.strip()} · "
+                f"El inventario físico no fue modificado."
+            )
+            time.sleep(0.5)
+            st.rerun()
+
+        except Exception as e:
+            _err(f"Error al registrar la Operación Express: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MODULO 4: AUDITORÍA 
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -870,6 +1047,8 @@ def main():
         ui_logistics(active_sheet, user)
     elif section == "pedidos":       
         ui_pedidos(active_sheet)
+    elif section == "express":                          # MEJORA 2: nueva ruta Express
+        ui_operacion_express(active_sheet, user)
     elif section == "auditoria" and rol == "admin":
         ui_history(active_sheet)
 
