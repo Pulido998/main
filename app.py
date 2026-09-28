@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║         GLASS MASTER INVENTARIO — (UI REDESIGN + DINÁMICO RACKS)         ║
-║         Arquitectura: Session State SSOT + Write-Through Cache          ║
+║         Escrituras atómicas y serializadas mediante Apps Script          ║
 ╠══════════════════════════════════════════════════════════════════════════╣
 ║  ESTE PASE: VISUALIZACIÓN COMPLETA + FILTRADO PARCIAL EN PANEL.          ║
 ║  · Muestra todos los cristales en Panel de Control (con o sin stock)     ║
@@ -16,22 +16,24 @@ from __future__ import annotations
 import re
 import time
 import base64
+import uuid
+from pathlib import Path
+from html import escape
+from gac_client import InventoryClient, ServiceUnavailable
 from datetime import datetime
 
-import gspread
 import pandas as pd
 import streamlit as st
-from google.oauth2.service_account import Credentials
 from PIL import Image
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN GLOBAL Y BRANDING
 # ═══════════════════════════════════════════════════════════════════════════
 
-LOGO = Image.open("logo.png")
+LOGO = Image.open(Path(__file__).with_name("logo.png")) if Path(__file__).with_name("logo.png").exists() else "📦"
 
 try:
-    with open("logo.png", "rb") as f:
+    with open(Path(__file__).with_name("logo.png"), "rb") as f:
         LOGO_B64 = base64.b64encode(f.read()).decode()
     LOGO_HTML = f'<img src="data:image/png;base64,{LOGO_B64}" style="max-height: 55px; width: auto; display: block; margin: 0 auto;">'
 except Exception:
@@ -51,12 +53,10 @@ SUCURSALES: dict[str, str] = {
     "Inventario_Suc4": "Moroleon",
 }
 
-USUARIOS: dict[str, dict] = {
-    "admin":     {"pass": "Xk9#mZ21!",    "rol": "admin", "sucursal": None},
-    "sucursal1": {"pass": "Suc1_Ax7$",    "rol": "user",  "sucursal": "Inventario_Suc1"},
-    "sucursal2": {"pass": "Br4nch_Two!",  "rol": "user",  "sucursal": "Inventario_Suc2"},
-    "sucursal3": {"pass": "T3rcera_P0s#", "rol": "user",  "sucursal": "Inventario_Suc3"},
-    "sucursal4": {"pass": "Moro_L3on$",   "rol": "user",  "sucursal": "Inventario_Suc4"},
+# Las contraseñas se configuran en st.secrets["passwords"].
+USUARIOS = {
+    "admin": {"rol": "admin", "sucursal": None},
+    **{f"sucursal{i}": {"rol": "user", "sucursal": f"Inventario_Suc{i}"} for i in range(1,5)},
 }
 
 TIPOS_PIEZA = ["Parabrisas", "Medallón", "Puerta", "Aleta", "Costado"]
@@ -113,7 +113,7 @@ CORPORATE_CSS = f"""
   [data-testid="stTabs"] [data-baseweb="tab"] {{ border-radius: 7px; font-weight: 500; font-size: 0.83rem; color: {C_TEXT_MED}; padding: 8px 16px; }}
   [data-testid="stTabs"] [aria-selected="true"] {{ background: {C_NAVY} !important; color: white !important; font-weight: 600; }}
   [data-testid="stTabs"] [data-baseweb="tab-border"] {{ display: none; }}
-  .stButton [data-testid="baseButton-primary"] {{ background: {{C_BLUE}} !important; border: none !important; border-radius: 8px !important; font-weight: 600 !important; letter-spacing: 0.01em; box-shadow: 0 1px 4px rgba(30,58,138,0.25); transition: all 0.18s; }}
+  .stButton [data-testid="baseButton-primary"] {{ background: {C_BLUE} !important; border: none !important; border-radius: 8px !important; font-weight: 600 !important; letter-spacing: 0.01em; box-shadow: 0 1px 4px rgba(30,58,138,0.25); transition: all 0.18s; }}
   .stButton [data-testid="baseButton-primary"]:hover {{ background: {C_BLUE_LT} !important; box-shadow: 0 4px 12px rgba(30,58,138,0.35); transform: translateY(-1px); }}
   [data-testid="stFormSubmitButton"] button[kind="primary"] {{ background: {C_BLUE} !important; border: none !important; border-radius: 8px !important; font-weight: 600 !important; box-shadow: 0 1px 4px rgba(30,58,138,0.25); }}
   [data-testid="stFormSubmitButton"] button[kind="primary"]:hover {{ background: {C_BLUE_LT} !important; }}
@@ -152,270 +152,133 @@ def _inject_css():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _clean(text) -> str:
-    if text is None:
-        return ""
-    return " ".join(str(text).strip().upper().split())
+    return " ".join(str(text or "").strip().upper().split())
 
 def _normalize_rack(raw) -> str:
     t = _clean(raw)
-    if not t:
+    if t in ("", "RACK", "SIN RACK", "SIN ASIGNAR", "RACK SIN RACK", "RACK SIN ASIGNAR"):
         return "RACK SIN ASIGNAR"
-    if re.fullmatch(r"\d+", t):
-        return f"RACK {t}"
-    if "SIN PEINE" in t:
-        return "RACK SIN PEINE"
-    if "PEINE" in t:
-        return "RACK PEINE"
-    if t.startswith("RACK "):
-        parts = t.split(None, 1)
-        suffix = parts[1].strip() if len(parts) > 1 else ""
-        return f"RACK {suffix}" if suffix else "RACK SIN ASIGNAR"
-    return f"RACK {t}"
+    t = re.sub(r"^RACK\s*", "", t).strip()
+    if re.fullmatch(r"[0-9]+", t): t = str(int(t))
+    return "RACK " + t
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CONEXIÓN Y DATOS
-# ═══════════════════════════════════════════════════════════════════════════
+INV_COLUMNS = ["CLAVE", "NOMBRE", "RACK", "CANTIDAD", "FECHA"]
+PENDING_COLUMNS = ["FECHA", "CLAVE", "NOMBRE", "CANTIDAD", "ORIGEN", "DESTINO", "ID_TRASLADO", "RACK_ORIGEN"]
+MOV_COLUMNS = ["FECHA", "CLAVE", "TIPO", "DETALLE", "CANTIDAD", "PRECIO", "USUARIO", "SUCURSAL", "ID_OPERACION", "ID_TRASLADO"]
 
-@st.cache_resource
-def _connect_gsheets():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
-    return gspread.authorize(creds).open("Inventario_Cristales")
+def _client():
+    return InventoryClient(st.secrets["inventory_api"]["url"], st.secrets["inventory_api"]["token"])
 
-def _sheet(name: str):
-    return _connect_gsheets().worksheet(name)
+def _columns(name):
+    return INV_COLUMNS if name in SUCURSALES else PENDING_COLUMNS if name == "Traslados_Pendientes" else MOV_COLUMNS
 
-def _load_df(sheet_name: str) -> pd.DataFrame:
-    ws = _sheet(sheet_name)
-    records = ws.get_all_records()
-    df = pd.DataFrame(records)
-    if df.empty:
-        return df
-    if "CLAVE" in df.columns: df["CLAVE"] = df["CLAVE"].apply(_clean)
-    if "RACK" in df.columns: df["RACK"] = df["RACK"].apply(_normalize_rack)
-    if "NOMBRE" in df.columns: df["NOMBRE"] = df["NOMBRE"].astype(str)
-    if "CANTIDAD" in df.columns: df["CANTIDAD"] = pd.to_numeric(df["CANTIDAD"], errors="coerce").fillna(0).astype(int)
-    return df
+def _refresh_all():
+    result = _client().snapshot(st.session_state["_user"])
+    # Actualizar la vista solo cuando llegó la instantánea completa.
+    frames = {f"df_{n}": pd.DataFrame(result.get(n, []), columns=_columns(n))
+              for n in list(SUCURSALES) + ["Movimientos", "Traslados_Pendientes"]}
+    st.session_state.update(frames)
+    st.session_state["_data_loaded"] = True
+    st.session_state["_loaded_at"] = time.monotonic()
 
 def _init_session():
-    if not st.session_state.get("_data_loaded", False):
-        with st.spinner("⏳ Sincronizando inventario…"):
-            try:
-                sheets = list(SUCURSALES.keys()) + ["Movimientos", "Traslados_Pendientes"]
-                for name in sheets: st.session_state[f"df_{name}"] = _load_df(name)
-                st.session_state["_data_loaded"] = True
-            except Exception as e:
-                st.error(f"⚠️ Error de conexión con Google Sheets: {e}")
-                st.stop()
+    if not st.session_state.get("_data_loaded") or time.monotonic() - st.session_state.get("_loaded_at", 0) > 30:
+        try:
+            with st.spinner("⏳ Sincronizando inventario…"): _refresh_all()
+        except Exception as exc:
+            st.error(f"No se pudo actualizar la vista: {exc}")
+            st.stop()
 
-def _refresh(sheet_name: str):
-    st.session_state[f"df_{sheet_name}"] = _load_df(sheet_name)
+def _refresh(sheet_name):
+    _refresh_all()
 
-def _get_df(sheet_name: str) -> pd.DataFrame:
-    key = f"df_{sheet_name}"
-    if key not in st.session_state: _refresh(sheet_name)
-    return st.session_state.get(key, pd.DataFrame())
+def _get_df(name):
+    return st.session_state.get(f"df_{name}", pd.DataFrame(columns=_columns(name))).copy()
 
-def _get_df_stock(sheet_name: str) -> pd.DataFrame:
-    df = _get_df(sheet_name)
-    if df.empty or "CANTIDAD" not in df.columns: return df
+def _get_df_stock(name):
+    df = _get_df(name)
     return df[df["CANTIDAD"] > 0].copy()
 
-def _search_keys(df: pd.DataFrame, term: str) -> list[str]:
-    if df.empty or "CLAVE" not in df.columns or not term: return []
-    t = _clean(term)
-    pool = df[df["CANTIDAD"] > 0] if "CANTIDAD" in df.columns else df
-    mask = pool["CLAVE"].str.contains(t, case=False, na=False)
-    return sorted(pool.loc[mask, "CLAVE"].unique().tolist())
+def _search_keys(df, term):
+    if df.empty or not term: return []
+    pool = df[df["CANTIDAD"] > 0]
+    return sorted(pool.loc[pool["CLAVE"].str.contains(_clean(term), case=False, na=False, regex=False), "CLAVE"].unique().tolist())
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CAPA DE ESCRITURA
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _find_row(ws, clave: str, rack: str) -> tuple[int | None, int]:
-    records = ws.get_all_records()
-    for i, row in enumerate(records):
-        if _clean(row.get("CLAVE", "")) == clave and _normalize_rack(row.get("RACK", "")) == rack:
-            qty = int(pd.to_numeric(row.get("CANTIDAD", 0), errors="coerce") or 0)
-            return i + 2, qty
-    return None, 0
-
-def _log_movement(clave, tipo, detalle, cantidad, precio, usuario, sucursal):
+def _submit_command(command):
+    # El mismo ID y contenido se conservan incluso si se pierde la respuesta.
     try:
-        ws = _sheet("Movimientos")
-        ws.append_row([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), clave, tipo, detalle, cantidad, precio, usuario, sucursal])
+        client = _client()
     except Exception:
-        pass
+        return False, "Revisa inventory_api.url e inventory_api.token en los secretos de Streamlit."
+    st.session_state["_pending_operation"] = command
+    try:
+        result = client.execute(command)
+    except ServiceUnavailable as exc:
+        return False, f"No se confirmó el resultado: {exc}. ID: {command['id']}. Usa Reintentar operación pendiente."
+    if result.get("ok"):
+        st.session_state.pop("_pending_operation", None)
+        st.session_state["_completed_operation"] = result
+        st.session_state["_data_loaded"] = False
+        return True, result["message"]
+    if result.get("code") in {"VALIDACION", "PERMISO", "ID_REUTILIZADO", "AUTH", "CONFIGURACION", "FORMATO"}:
+        st.session_state.pop("_pending_operation", None)
+    return False, result.get("message", "No se pudo confirmar la operación.")
+
+def _operate(action, branch, data, user):
+    if not st.session_state.get("_logged") or user != st.session_state.get("_user"):
+        return False, "La sesión no está autorizada."
+    if st.session_state.get("_pending_operation"):
+        return False, "Primero confirma la operación pendiente usando su mismo identificador."
+    if st.session_state.get("_completed_operation"):
+        return False, "La operación anterior ya está registrada. Pulsa Registrar otra operación."
+    command = {"id": uuid.uuid4().hex, "action": action, "branch": branch, "user": user, "payload": data}
+    return _submit_command(command)
 
 def op_alta(sheet, clave, nombre, rack_raw, qty, usuario):
-    try:
-        ws = _sheet(sheet)
-        clave = _clean(clave)
-        rack = _normalize_rack(rack_raw)
-        fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        row, current = _find_row(ws, clave, rack)
-        if row:
-            new_qty = current + qty
-            ws.update_cell(row, 4, new_qty)
-            ws.update_cell(row, 5, fecha)
-            msg = f"Stock actualizado en {rack}: {current} → {new_qty} pz."
-        else:
-            ws.append_row([clave, nombre, rack, qty, fecha])
-            msg = f"Nuevo registro: {clave} en {rack} ({qty} pz)."
-        _log_movement(clave, "Alta/Compra", f"Entrada en {rack}", qty, 0, usuario, sheet)
-        _refresh(sheet); _refresh("Movimientos")
-        return True, msg
-    except Exception as e:
-        return False, f"Error en Alta: {e}"
+    return _operate("alta", sheet, {"key":clave,"name":nombre,"rack":rack_raw,"qty":qty}, usuario)
 
 def op_venta(sheet, clave, rack, detalle, qty, precio, usuario):
-    try:
-        ws = _sheet(sheet)
-        clave = _clean(clave)
-        rack = _normalize_rack(rack)
-        row, current = _find_row(ws, clave, rack)
-        if not row: return False, f"No se encontró {clave} en {rack}."
-        if current < qty: return False, f"Stock insuficiente. Disponible: {current} pz."
-        new_qty = current - qty
-        
-        # ═══════════════════════════════════════════════════════════════════════════
-        # REGLA: ELIMINAR REGISTROS SI QUEDAN EN 0 Y ES UN RACK GENÉRICO / SIN NÚMERO
-        # ═══════════════════════════════════════════════════════════════════════════
-        racks_genericos = ["RACK SIN PEINE", "RACK PISO", "RACK SIN ASIGNAR", "SIN RACK"]
-        has_number = any(char.isdigit() for char in rack)
-        
-        if new_qty == 0 and (rack in racks_genericos or not has_number):
-            ws.delete_rows(row)
-            msg = f"Venta confirmada. Registro removido del inventario por quedar en 0 pz en rack genérico."
-        else:
-            ws.update_cell(row, 4, new_qty)
-            ws.update_cell(row, 5, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            msg = f"Venta confirmada. Quedan {new_qty} pz en {rack}."
-            
-        _log_movement(clave, "Venta/Instalación", f"{detalle} (desde {rack})", qty, precio, usuario, sheet)
-        _refresh(sheet); _refresh("Movimientos")
-        return True, msg
-    except Exception as e:
-        return False, f"Error en Venta: {e}"
+    return _operate("venta", sheet, {"key":clave,"rack":rack,"detail":detalle,"qty":qty,"price":precio}, usuario)
 
 def op_send_transfer(sheet_origin, clave, rack, qty, dest_sheet, usuario):
-    try:
-        ws = _sheet(sheet_origin)
-        clave = _clean(clave)
-        rack = _normalize_rack(rack)
-        row, current = _find_row(ws, clave, rack)
-        if not row: return False, f"No se encontró {clave} en {rack}."
-        if current < qty: return False, f"Stock insuficiente. Disponible: {current} pz."
-        nombre = ws.cell(row, 2).value or "Sin Nombre"
-        
-        new_qty = current - qty
-        # ═══════════════════════════════════════════════════════════════════════════
-        # REGLA: ELIMINAR REGISTROS SI QUEDAN EN 0 Y ES UN RACK GENÉRICO / SIN NÚMERO
-        # ═══════════════════════════════════════════════════════════════════════════
-        racks_genericos = ["RACK SIN PEINE", "RACK PISO", "RACK SIN ASIGNAR", "SIN RACK"]
-        has_number = any(char.isdigit() for char in rack)
-        
-        if new_qty == 0 and (rack in racks_genericos or not has_number):
-            ws.delete_rows(row)
-            msg = f"Traslado enviado. Registro removido del inventario por quedar en 0 pz."
-        else:
-            ws.update_cell(row, 4, new_qty)
-            msg = f"Traslado enviado. Quedan {new_qty} pz en {rack}."
-            
-        fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _sheet("Traslados_Pendientes").append_row([fecha, clave, nombre, qty, sheet_origin, dest_sheet])
-        _log_movement(clave, "Envío Traslado", f"De {sheet_origin}/{rack} → {SUCURSALES.get(dest_sheet, dest_sheet)}", qty, 0, usuario, sheet_origin)
-        _refresh(sheet_origin); _refresh("Traslados_Pendientes"); _refresh("Movimientos")
-        return True, msg
-    except Exception as e:
-        return False, f"Error en traslado: {e}"
+    return _operate("send", sheet_origin, {"key":clave,"rack":rack,"qty":qty,"destination":dest_sheet}, usuario)
 
-def op_receive_transfer(dest_sheet, clave, nombre, qty, rack_raw, pending_row, usuario):
-    try:
-        ok, msg = op_alta(dest_sheet, clave, nombre, rack_raw, qty, usuario)
-        if not ok: return False, msg
-        _sheet("Traslados_Pendientes").delete_rows(pending_row)
-        _log_movement(clave, "Recepción Traslado", f"Guardado en {_normalize_rack(rack_raw)}", qty, 0, usuario, dest_sheet)
-        _refresh("Traslados_Pendientes"); _refresh("Movimientos")
-        return True, f"{qty} pz de {clave} recibidas en {_normalize_rack(rack_raw)}."
-    except Exception as e:
-        return False, f"Error al recibir traslado: {e}"
+def op_receive_transfer(dest_sheet, transfer_id, qty, rack_raw, usuario):
+    return _operate("receive", dest_sheet, {"transfer_id":transfer_id,"qty":qty,"rack":rack_raw}, usuario)
 
 def op_cancel_transfer(origin_sheet, item, rack_return_raw, usuario):
-    try:
-        ws_p = _sheet("Traslados_Pendientes")
-        records = ws_p.get_all_records()
-        real_row = None
-        for i, row in enumerate(records):
-            if str(row.get("FECHA", "")) == str(item["FECHA"]) and _clean(row.get("CLAVE", "")) == _clean(item["CLAVE"]):
-                real_row = i + 2
-                break
-        if not real_row: return False, "El traslado ya fue aceptado por el destino."
-        qty = int(item["CANTIDAD"])
-        ok, msg = op_alta(origin_sheet, item["CLAVE"], item["NOMBRE"], rack_return_raw, qty, usuario)
-        if not ok: return False, f"Error al restaurar inventario: {msg}"
-        ws_p.delete_rows(real_row)
-        _log_movement(item["CLAVE"], "Cancelación Traslado", f"Regresado a {_normalize_rack(rack_return_raw)}", qty, 0, usuario, origin_sheet)
-        _refresh("Traslados_Pendientes"); _refresh("Movimientos")
-        return True, "Traslado cancelado. Material restaurado al inventario."
-    except Exception as e:
-        return False, f"Error al cancelar: {e}"
+    return _operate("cancel", origin_sheet, {"transfer_id":item["ID_TRASLADO"],"rack":rack_return_raw}, usuario)
 
 def op_relocate(sheet, clave, nombre, rack_origin_raw, rack_dest_raw, qty, usuario):
-    try:
-        clave = _clean(clave)
-        rack_origin = _normalize_rack(rack_origin_raw)
-        rack_dest = _normalize_rack(rack_dest_raw)
-        if rack_origin == rack_dest: return False, "El rack de destino es igual al de origen."
-        ws = _sheet(sheet)
-        row_o, qty_o = _find_row(ws, clave, rack_origin)
-        if not row_o: return False, "No se encontró el artículo origen."
-        if qty_o < qty: return False, f"Cantidad insuficiente en origen ({qty_o} pz)."
-        
-        new_qty_o = qty_o - qty
-        # ═══════════════════════════════════════════════════════════════════════════
-        # REGLA: ELIMINAR REGISTROS SI QUEDAN EN 0 Y ES UN RACK GENÉRICO / SIN NÚMERO
-        # ═══════════════════════════════════════════════════════════════════════════
-        racks_genericos = ["RACK SIN PEINE", "RACK PISO", "RACK SIN ASIGNAR", "SIN RACK"]
-        has_number = any(char.isdigit() for char in rack_origin)
-        
-        if new_qty_o == 0 and (rack_origin in racks_genericos or not has_number):
-            ws.delete_rows(row_o)
-        else:
-            ws.update_cell(row_o, 4, new_qty_o)
-            
-        row_d, qty_d = _find_row(ws, clave, rack_dest)
-        if row_d:
-            ws.update_cell(row_d, 4, qty_d + qty)
-        else:
-            fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ws.append_row([clave, nombre, rack_dest, qty, fecha])
-        _log_movement(clave, "Reubicación Interna", f"De {rack_origin} → {rack_dest}", qty, 0, usuario, sheet)
-        _refresh(sheet); _refresh("Movimientos")
-        return True, f"{qty} pz de {clave} movidas a {rack_dest}."
-    except Exception as e:
-        return False, f"Error en reubicación: {e}"
+    return _operate("relocate", sheet, {"key":clave,"rack":rack_origin_raw,"destination_rack":rack_dest_raw,"qty":qty}, usuario)
 
 def op_clean_duplicates(sheet):
-    try:
-        ws = _sheet(sheet)
-        records = ws.get_all_records()
-        df = pd.DataFrame(records)
-        if df.empty: return True, "La hoja está vacía."
-        df["CLAVE"] = df["CLAVE"].apply(_clean)
-        df["RACK"] = df["RACK"].apply(_normalize_rack)
-        df["CANTIDAD"] = pd.to_numeric(df["CANTIDAD"], errors="coerce").fillna(0).astype(int)
-        before = len(df)
-        df_c = (df.groupby(["CLAVE", "RACK"], as_index=False).agg({"NOMBRE": "last", "CANTIDAD": "sum", "FECHA": "last"}))[["CLAVE", "NOMBRE", "RACK", "CANTIDAD", "FECHA"]]
-        removed = before - len(df_c)
-        if removed <= 0: return True, "Sin duplicados. La hoja ya está limpia."
-        ws.clear()
-        ws.update([df_c.columns.tolist()] + df_c.values.tolist())
-        _refresh(sheet)
-        return True, f"{removed} filas duplicadas consolidadas. Racks normalizados."
-    except Exception as e:
-        return False, f"Error en limpieza: {e}"
+    return _operate("clean", sheet, {}, st.session_state["_user"])
 
+def op_direct_sale(sheet, transfer_id, qty, detail, price, usuario):
+    return _operate("direct_sale", sheet, {"transfer_id":transfer_id,"qty":qty,"detail":detail,"price":price}, usuario)
+
+def op_order(sheet, text, name, rack, usuario):
+    return _operate("order", sheet, {"text":text,"name":name,"rack":rack}, usuario)
+
+def _operation_status():
+    pending = st.session_state.get("_pending_operation")
+    completed = st.session_state.get("_completed_operation")
+    if pending:
+        st.warning(f"Operación pendiente de confirmar. ID: {pending['id']}. No vuelvas a capturarla como nueva.")
+        if st.button("Reintentar operación pendiente", type="primary"):
+            ok, msg = _submit_command(pending)
+            if ok: st.rerun()
+            else: st.error(msg)
+        return True
+    if completed:
+        st.success(completed["message"])
+        st.caption(f"Comprobante: {completed['id']}")
+        if st.button("Registrar otra operación", type="primary"):
+            st.session_state.pop("_completed_operation", None)
+            st.rerun()
+        return True
+    return False
 
 # ═══════════════════════════════════════════════════════════════════════════
 # HELPERS DE UI
@@ -433,8 +296,8 @@ def _section(text):
 def _rack_tag(raw):
     if raw: st.markdown(f'<div style="margin-top:4px"><span class="rack-preview">→ {_normalize_rack(raw)}</span></div>', unsafe_allow_html=True)
 
-def _ok(msg): st.markdown(f'<div class="toast-success">✓ {msg}</div>', unsafe_allow_html=True)
-def _err(msg): st.markdown(f'<div class="toast-error">✗ {msg}</div>', unsafe_allow_html=True)
+def _ok(msg): st.markdown(f'<div class="toast-success">✓ {escape(str(msg))}</div>', unsafe_allow_html=True)
+def _err(msg): st.markdown(f'<div class="toast-error">✗ {escape(str(msg))}</div>', unsafe_allow_html=True)
 
 def _stock_column_config():
     return {"CLAVE": st.column_config.TextColumn("Clave Única", width="medium"), "NOMBRE": st.column_config.TextColumn("Descripción / Tipo", width="large"), "RACK": st.column_config.TextColumn("📍 Ubicación Rack", width="medium"), "CANTIDAD": st.column_config.NumberColumn("Existencia", format="%d pz", width="small")}
@@ -459,7 +322,7 @@ def ui_login():
             password = st.text_input("Contraseña", type="password", placeholder="••••••••••").strip()
             if st.button("INICIAR SESIÓN →", type="primary", use_container_width=True):
                 data = USUARIOS.get(usuario)
-                if data and data["pass"] == password:
+                if data and password and st.secrets.get("passwords", {}).get(usuario) == password:
                     st.session_state.update({"_logged": True, "_user": usuario, "_rol": data["rol"], "_own_sheet": data["sucursal"] or "Inventario_Suc1"})
                     st.rerun()
                 else:
@@ -493,7 +356,7 @@ def ui_sidebar() -> tuple[str, str]:
             active_sheet = own_sheet
             st.markdown(f'<div class="sb-suc-label">🏢 Sucursal asignada</div><div class="sb-suc-name">{SUCURSALES.get(active_sheet, active_sheet)}</div>', unsafe_allow_html=True)
 
-        st.markdown(f'<div class="sb-user-chip"><div><div class="sb-user-name">👤 {user}</div><div class="sb-user-rol" style="color:{"#818CF8" if rol == "admin" else "#A7F3D0"}">{rol}</div></div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="sb-user-chip"><div><div class="sb-user-name">👤 {user}</div><div class="sb-user-rol" style="color:{C_BLUE_LT if rol == "admin" else C_GREEN}">{rol}</div></div></div>', unsafe_allow_html=True)
         st.markdown("---")
 
         # 🚨 CANDADO DE SEGURIDAD CORREGIDO: Ocultar Auditoría a usuarios regulares
@@ -509,7 +372,10 @@ def ui_sidebar() -> tuple[str, str]:
         )
 
         st.markdown("<br><br><br>", unsafe_allow_html=True)
-        if st.button("🚪 Cerrar Sesión", use_container_width=True):
+        if st.button("🔄 Actualizar datos", use_container_width=True):
+            st.session_state["_data_loaded"] = False
+            st.rerun()
+        if st.button("🚪 Cerrar Sesión", use_container_width=True, disabled=bool(st.session_state.get("_pending_operation"))):
             st.session_state.clear()
             st.rerun()
 
@@ -538,10 +404,11 @@ def ui_dashboard(sheet: str, rol: str):
     st.markdown("---")
     if rol == "admin":
         with st.expander("🧹 Mantenimiento — Consolidar Duplicados y Normalizar Racks"):
-            st.warning(f"Consolida filas duplicadas en {nombre_suc}. No se pierde stock.")
-            if st.button("▶️ Ejecutar Limpieza", type="primary"):
+            st.warning(f"Suma cantidades de filas con la misma clave y rack en {nombre_suc}. Conserva el total registrado; no determina si el stock físico es correcto.")
+            if st.button("▶️ Ejecutar Limpieza", type="primary", disabled=bool(st.session_state.get("_completed_operation") or st.session_state.get("_pending_operation"))):
                 ok, msg = op_clean_duplicates(sheet)
                 _ok(msg) if ok else _err(msg)
+                if ok: st.rerun()
 
     if df_all.empty:
         st.info("No hay productos registrados en esta sucursal.")
@@ -552,7 +419,7 @@ def ui_dashboard(sheet: str, rol: str):
         filtro = st.text_input("Buscar en inventario:", placeholder="Ej: 75, FW, Rack...", key="wh_filter").strip().upper()
         df_view = df_all.copy()
         if filtro:
-            mask = df_view.astype(str).apply(lambda col: col.str.contains(filtro, case=False, na=False)).any(axis=1)
+            mask = df_view.astype(str).apply(lambda col: col.str.contains(filtro, case=False, na=False, regex=False)).any(axis=1)
             df_view = df_view[mask]
         
         if df_view.empty:
@@ -593,7 +460,7 @@ def ui_operations(sheet: str, usuario: str):
         if clave_sug and len(clave_sug) >= 2:
             df_all_inv = _get_df(sheet)
             if not df_all_inv.empty and "CLAVE" in df_all_inv.columns:
-                coincidencias = df_all_inv[df_all_inv["CLAVE"].str.contains(clave_sug, case=False, na=False)]
+                coincidencias = df_all_inv[df_all_inv["CLAVE"].str.contains(clave_sug, case=False, na=False, regex=False)]
                 if not coincidencias.empty:
                     with st.expander(f"💡 Sugerencias y Racks encontrados en el sistema para '{clave_sug}':", expanded=True):
                         for _, r in coincidencias.head(6).iterrows():
@@ -718,12 +585,14 @@ def ui_logistics(sheet: str, usuario: str):
             st.dataframe(display_r[["FECHA", "ORIGEN", "CLAVE", "NOMBRE", "CANTIDAD"]], use_container_width=True, hide_index=True, column_config=_logistics_column_config("ORIGEN"))
 
             _section("📥 Procesamiento Individual por Pieza / Rack")
-            opts_r = recv.apply(lambda r: f"{r['CLAVE']} ({r['CANTIDAD']} pz) de {SUCURSALES.get(r['ORIGEN'], r['ORIGEN'])} [{r['FECHA']}]", axis=1).tolist()
-            sel_r = st.selectbox("Selecciona la pieza a procesar:", opts_r)
-            fila = recv.iloc[opts_r.index(sel_r)]
+            opts_r = recv.apply(lambda r: f"{r['CLAVE']} ({r['CANTIDAD']} pz) de {SUCURSALES.get(r['ORIGEN'], r['ORIGEN'])} [{r['FECHA']}] · {r['ID_TRASLADO'][-8:]}", axis=1).tolist()
+            ids_r = recv["ID_TRASLADO"].tolist()
+            labels_r = dict(zip(ids_r, opts_r))
+            sel_r = st.selectbox("Selecciona la pieza a procesar:", ids_r, format_func=labels_r.__getitem__)
+            fila = recv.loc[recv["ID_TRASLADO"] == sel_r].iloc[0]
 
             clave_proc, nombre_proc, total_disp = fila["CLAVE"], fila["NOMBRE"], int(fila["CANTIDAD"])
-            pending_row, origen_proc = int(fila["index"]) + 2, fila["ORIGEN"]
+            transfer_id, origen_proc = fila["ID_TRASLADO"], fila["ORIGEN"]
 
             tipo_proc = st.radio("Acción:", ["📥 Ingresar al Almacén (Asignar Racks)", "💥 Dar de baja inmediatamente (Siniestro/Venta)"], horizontal=True)
 
@@ -737,18 +606,9 @@ def ui_logistics(sheet: str, usuario: str):
                 if st.button("📥 Confirmar Ingreso", type="primary"):
                     if not rack_rec: st.warning("⚠️ Debes especificar un rack.")
                     else:
-                        if qty_rec == total_disp:
-                            ok, msg = op_receive_transfer(sheet, clave_proc, nombre_proc, qty_rec, rack_rec, pending_row, usuario)
-                        else:
-                            try:
-                                ok, msg_alta = op_alta(sheet, clave_proc, nombre_proc, rack_rec, qty_rec, usuario)
-                                if ok:
-                                    _sheet("Traslados_Pendientes").update_cell(pending_row, 4, total_disp - qty_rec)
-                                    msg = f"Ingreso parcial de {qty_rec} pz al {rack_rec}. Restan {total_disp - qty_rec}."
-                                else: msg = msg_alta
-                            except Exception as e: ok, msg = False, f"Error: {e}"
+                        ok, msg = op_receive_transfer(sheet, transfer_id, qty_rec, rack_rec, usuario)
 
-                        if ok: _ok(msg); _refresh("Traslados_Pendientes"); time.sleep(0.5); st.rerun()
+                        if ok: _ok(msg); st.rerun()
                         else: _err(msg)
 
             else:
@@ -771,17 +631,10 @@ def ui_logistics(sheet: str, usuario: str):
                     if nota: detalle += f" — {nota}"
 
                     if st.form_submit_button("💥 Confirmar Baja", type="primary", use_container_width=True):
-                        try:
-                            _log_movement(clave_proc, "Venta/Instalación", detalle, qty_baja, precio, usuario, sheet)
-                            ws_p = _sheet("Traslados_Pendientes")
-                            if qty_baja == total_disp:
-                                ws_p.delete_rows(pending_row)
-                                msg = f"Baja total confirmada."
-                            else:
-                                ws_p.update_cell(pending_row, 4, total_disp - qty_baja)
-                                msg = f"Baja parcial de {qty_baja} pz."
-                            _ok(msg); _refresh("Traslados_Pendientes"); _refresh("Movimientos"); time.sleep(0.5); st.rerun()
-                        except Exception as e: _err(f"Error: {e}")
+                        ok, msg = op_direct_sale(sheet, transfer_id, qty_baja, detalle, precio, usuario)
+                        if ok: _ok(msg); st.rerun()
+                        else: _err(msg)
+
 
     with tab_sent:
         sent = df_p[df_p["ORIGEN"] == sheet].reset_index(drop=False)
@@ -792,8 +645,11 @@ def ui_logistics(sheet: str, usuario: str):
             display_s["DESTINO"] = display_s["DESTINO"].map(SUCURSALES).fillna(display_s["DESTINO"])
             st.dataframe(display_s[["FECHA", "DESTINO", "CLAVE", "NOMBRE", "CANTIDAD"]], use_container_width=True, hide_index=True, column_config=_logistics_column_config("DESTINO"))
             
-            opts_c = sent.apply(lambda r: f"{r['CLAVE']} ({r['CANTIDAD']} pz) → {SUCURSALES.get(r['DESTINO'], r['DESTINO'])}", axis=1).tolist()
-            fila_c = sent.iloc[opts_c.index(st.selectbox("Envío a cancelar:", opts_c))]
+            opts_c = sent.apply(lambda r: f"{r['CLAVE']} ({r['CANTIDAD']} pz) → {SUCURSALES.get(r['DESTINO'], r['DESTINO'])} · {r['ID_TRASLADO'][-8:]}", axis=1).tolist()
+            ids_c = sent["ID_TRASLADO"].tolist()
+            labels_c = dict(zip(ids_c, opts_c))
+            selected_id = st.selectbox("Envío a cancelar:", ids_c, format_func=labels_c.__getitem__)
+            fila_c = sent.loc[sent["ID_TRASLADO"] == selected_id].iloc[0]
 
             with st.form("form_cancel"):
                 rack_ret = st.text_input("Rack para regresar el material:", value="PISO").strip()
@@ -834,46 +690,10 @@ def ui_pedidos(sheet: str):
             st.warning("⚠️ El cuadro de texto está vacío.")
             return
             
-        lineas = [linea.strip() for linea in texto_pedido.split("\n") if linea.strip()]
-        exitos = 0
-        errores = 0
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        for idx, linea in enumerate(lineas):
-            try:
-                status_text.caption(f"Procesando línea {idx+1}/{len(lineas)}: {linea}")
-                
-                # Extracción dinámica de 1, 2 o 3 parámetros (Clave, Cantidad, Rack)
-                partes = [p.strip() for p in linea.split(",")]
-                clave_raw = partes[0]
-                cantidad = 1
-                rack_item = rack_comun
-                
-                if len(partes) >= 2:
-                    try: cantidad = int(partes[1])
-                    except ValueError: cantidad = 1
-                        
-                if len(partes) >= 3:
-                    rack_item = partes[2]
-                
-                if not clave_raw:
-                    continue
-                    
-                ok, msg = op_alta(sheet, clave_raw, tipo_comun, rack_item, cantidad, usuario)
-                if ok: exitos += 1
-                else: errores += 1
-            except Exception:
-                errores += 1
-            progress_bar.progress((idx + 1) / len(lineas))
-            
-        status_text.empty()
-        if exitos > 0: _ok(f"✅ ¡Pedido procesado con éxito! {exitos} líneas registradas.")
-        if errores > 0: _err(f"❌ Hubo problemas al procesar {errores} líneas.")
-            
-        time.sleep(1.0)
-        st.rerun()
+        ok, msg = op_order(sheet, texto_pedido, tipo_comun, rack_comun, usuario)
+        if ok: _ok(msg); st.rerun()
+        else: _err(msg)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # MODULO 4: AUDITORÍA 
@@ -912,8 +732,11 @@ def main():
         ui_login()
         return
 
+    blocked = _operation_status()
     _init_session()
     active_sheet, section = ui_sidebar()
+    if blocked and section in ("operaciones", "logistica", "pedidos"):
+        return
     user = st.session_state["_user"]
     rol = st.session_state["_rol"]
 
